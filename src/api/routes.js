@@ -14,6 +14,7 @@ const { getProgressStream, subscribeProgress } = require("../scheduler/progress.
 const fs = require("fs");
 const path = require("path");
 const logger = require("../utils/logger");
+const supabase = require("../core/supabase");
 
 const router = express.Router();
 
@@ -500,5 +501,83 @@ function getTzOffsetMinutes(tz) {
   };
   return offsets[tz] || 0;
 }
+
+// ── GET /api/history/execution — Get recent sync executions from Supabase ──
+router.get("/api/history/execution", requireAuth, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const executions = await supabase.queryRecentExecutions(limit);
+    res.json({ executions, count: executions.length });
+  } catch (e) {
+    res.json({ executions: [], count: 0, error: e.message });
+  }
+});
+
+// ── GET /api/history/execution/:id — Get full details of a sync execution ──
+router.get("/api/history/execution/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [execution, clientResults, contactResults] = await Promise.all([
+      supabase.queryRecentExecutions(1),
+      supabase.queryClientResults(id),
+      supabase.queryContactResults(id)
+    ]);
+    const exec = execution.find(e => e.id === id) || null;
+    res.json({ execution: exec, clients: clientResults, contacts: contactResults });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /api/history/errors — Get recent sync errors from Supabase ──
+router.get("/api/history/errors", requireAuth, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const allExecs = await supabase.queryRecentExecutions(10);
+    let allErrors = [];
+    for (const exec of allExecs) {
+      const errors = await supabase.queryContactResults(exec.id, "failed");
+      allErrors = allErrors.concat(errors);
+    }
+    res.json({ errors: allErrors.slice(0, limit), count: allErrors.length });
+  } catch (e) {
+    res.json({ errors: [], count: 0, error: e.message });
+  }
+});
+
+// ── GET /api/history/memory — Get memory history from Supabase ──
+router.get("/api/history/memory", requireAuth, async (req, res) => {
+  try {
+    const hours = Math.min(parseInt(req.query.hours) || 24, 168); // max 7 days
+    const snapshots = await supabase.queryMemoryHistory(hours);
+    res.json({ snapshots, count: snapshots.length, hours });
+  } catch (e) {
+    res.json({ snapshots: [], count: 0, error: e.message });
+  }
+});
+
+// ── GET /api/history/events — Get server events from Supabase ──
+router.get("/api/history/events", requireAuth, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const events = await supabase.queryServerEvents(limit);
+    res.json({ events, count: events.length });
+  } catch (e) {
+    res.json({ events: [], count: 0, error: e.message });
+  }
+});
+
+// ── GET /api/history/logs — Get logs from Supabase (persistent across restarts) ──
+router.get("/api/history/logs", requireAuth, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 200, 1000);
+    const level = req.query.level || null;
+    const since = req.query.since || null;
+    const logs = await supabase.queryRecentLogs(limit, level, since);
+    res.json({ logs, count: logs.length });
+  } catch (e) {
+    res.json({ logs: [], count: 0, error: e.message });
+  }
+});
 
 module.exports = router;

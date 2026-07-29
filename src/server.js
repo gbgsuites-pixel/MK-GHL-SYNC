@@ -9,15 +9,16 @@ const express = require("express");
 const { loadConfig } = require("./core/config");
 const { startCron } = require("./scheduler/cron");
 const { closeAllSessions } = require("./sessions/sessionManager");
-const routes = require("./api/routes");
+const supabase = require("./core/supabase");
 const logger = require("./utils/logger");
+const routes = require("./api/routes");
 
 const PORT = process.env.PORT || 3000;
 
 // ── Initialize ──
 logger.info("═══════════════════════════════════════════════════════");
 logger.info("  Mary Kay InTouch — GoHighLevel Sync Server");
-logger.info("  Version 2.0.0 (Puppeteer-Direct Architecture)");
+logger.info("  Version 2.1.0 (Puppeteer-Direct Architecture)");
 logger.info("═══════════════════════════════════════════════════════");
 
 // Load configuration
@@ -28,9 +29,117 @@ try {
   process.exit(1);
 }
 
+// Wire logger to Supabase for persistent log storage
+logger.setSupabaseModule(supabase);
+
 // Create Express app
 const app = express();
 app.use(express.json());
+
+// ── Global Error Handlers — Prevent Puppeteer crashes from killing the process ──
+// Catch unhandled promise rejections (e.g., Puppeteer ProtocolError)
+process.on("unhandledRejection", (reason, promise) => {
+  const errMessage = reason instanceof Error ? reason.message : String(reason);
+  logger.error(`[Server] UNHANDLED REJECTION: ${errMessage}`);
+
+  // Check if this is a Puppeteer-related error that should not kill the process
+  const isPuppeteerError =
+    errMessage.includes("ProtocolError") ||
+    errMessage.includes("Target closed") ||
+    errMessage.includes("Session closed") ||
+    errMessage.includes("Network.enable timed out") ||
+    errMessage.includes("CDP") ||
+    errMessage.includes("NetworkManager");
+
+  if (isPuppeteerError) {
+    logger.warn(`[Server] Puppeteer error detected — logging but NOT killing the process.`);
+    logger.warn(`[Server] Active syncs will be terminated gracefully by their own error handlers.`);
+  } else {
+    // For non-Puppeteer errors, log full stack trace and exit
+    logger.error(`[Server] Fatal non-Puppeteer error — shutting down.`);
+    logger.error(`[Server] Stack: ${reason instanceof Error ? reason.stack : "N/A"}`);
+    process.exit(1);
+  }
+});
+
+// Catch uncaught exceptions
+process.on("uncaughtException", (err) => {
+  const isPuppeteerError =
+    err.message.includes("ProtocolError") ||
+    err.message.includes("Target closed") ||
+    err.message.includes("Session closed") ||
+    err.message.includes("Network.enable timed out") ||
+    err.message.includes("CDP");
+
+  if (isPuppeteerError) {
+    logger.error(`[Server] UNCAUGHT PUPPETEER EXCEPTION: ${err.message}`);
+    logger.warn(`[Server] Puppeteer error — logging but NOT killing the process.`);
+  } else {
+    logger.error(`[Server] UNCAUGHT EXCEPTION: ${err.message}`);
+    logger.error(`[Server] Stack: ${err.stack}`);
+    process.exit(1);
+  }
+});
+
+// ── Memory Monitoring — Log memory usage every 60 seconds ──
+function logMemoryUsage() {
+  const mem = process.memoryUsage();
+  const rssMB = Math.round(mem.rss / 1024 / 1024);
+  const heapUsedMB = Math.round(mem.heapUsed / 1024 / 1024);
+  const heapTotalMB = Math.round(mem.heapTotal / 1024 / 1024);
+  logger.info(`[Server] Memory: RSS=${rssMB}MB, Heap Used=${heapUsedMB}MB, Heap Total=${heapTotalMB}MB`);
+
+  // ── Supabase: Record memory snapshot ──
+  try {
+    supabase.recordMemorySnapshot(rssMB, heapUsedMB, heapTotalMB);
+  } catch (_) {}
+}
+
+// Log memory every 60 seconds to detect leaks
+const memoryMonitor = setInterval(logMemoryUsage, 60000);
+// Prevent the monitor from keeping the process alive
+if (memoryMonitor.unref) memoryMonitor.unref();
+
+// ── Keep-Alive Mechanism — Prevent Render from spinning down the instance ──
+// Render free tier spins down after 15 minutes of inactivity.
+// This self-ping keeps the process alive even when no external requests arrive.
+const KEEP_ALIVE_INTERVAL_MS = parseInt(process.env.KEEP_ALIVE_INTERVAL_MS) || 300000; // 5 min
+let keepAliveInterval = null;
+
+function startKeepAlive() {
+  if (process.env.RENDER === undefined && !process.env.RENDER_INSTANCE_ID) {
+    // Not running on Render, skip keep-alive
+    logger.info("[Server] Keep-alive not needed (not on Render).");
+    return;
+  }
+
+  keepAliveInterval = setInterval(async () => {
+    try {
+      const http = require("http");
+      await new Promise((resolve, reject) => {
+        const req = http.get(`http://localhost:${PORT}/health`, (res) => {
+          res.resume();
+          resolve();
+        });
+        req.on("error", reject);
+        req.setTimeout(5000, () => {
+          req.destroy();
+          reject(new Error("Keep-alive ping timeout"));
+        });
+      });
+      logger.debug(`[Server] Keep-alive ping successful.`);
+
+      // Record keep-alive event in Supabase
+      try { supabase.recordServerEvent("keep_alive", { timestamp: new Date().toISOString() }); } catch (_) {}
+    } catch (e) {
+      logger.warn(`[Server] Keep-alive ping failed: ${e.message}`);
+    }
+  }, KEEP_ALIVE_INTERVAL_MS);
+
+  // Allow the interval to be cleared on shutdown
+  if (keepAliveInterval.unref) keepAliveInterval.unref();
+  logger.info(`[Server] Keep-alive enabled: pinging /health every ${KEEP_ALIVE_INTERVAL_MS / 1000}s`);
+}
 
 // Mount routes
 app.use("/", routes);
@@ -42,20 +151,44 @@ app.listen(PORT, () => {
   // Start cron scheduler if configured
   startCron();
 
+  // Initialize Supabase (non-blocking)
+  supabase.initialize().then(() => {
+    if (supabase.isEnabled()) {
+      logger.info("[Supabase] Initialized successfully.");
+    }
+  }).catch(e => {
+    logger.warn(`[Supabase] Init error: ${e.message}`);
+  });
+
+  // Start keep-alive to prevent Render idle sleep
+  startKeepAlive();
+
   logger.info("[Server] Ready.");
   logger.info(`[Server] Health check: http://localhost:${PORT}/health`);
   logger.info("[Server] Architecture: Puppeteer-Direct (browser stays alive for API calls)");
+  logger.info(`[Server] Global error handlers: ACTIVE (Puppeteer errors will not kill process)`);
+
+  // Log initial memory state
+  logMemoryUsage();
 });
 
-// Graceful shutdown — close all browser sessions
+// Graceful shutdown — close all browser sessions and flush Supabase
 process.on("SIGTERM", async () => {
   logger.info("[Server] SIGTERM received. Shutting down gracefully...");
+  try { await supabase.recordServerEvent("server_shutdown", { reason: "SIGTERM" }); } catch (_) {}
+  await supabase.shutdown();
+  if (keepAliveInterval) clearInterval(keepAliveInterval);
+  if (memoryMonitor) clearInterval(memoryMonitor);
   await closeAllSessions();
   process.exit(0);
 });
 
 process.on("SIGINT", async () => {
   logger.info("[Server] SIGINT received. Shutting down gracefully...");
+  try { await supabase.recordServerEvent("server_shutdown", { reason: "SIGINT" }); } catch (_) {}
+  await supabase.shutdown();
+  if (keepAliveInterval) clearInterval(keepAliveInterval);
+  if (memoryMonitor) clearInterval(memoryMonitor);
   await closeAllSessions();
   process.exit(0);
 });

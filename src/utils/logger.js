@@ -2,6 +2,11 @@
 // LOGGER
 // Structured logging with timestamps and levels.
 // Also maintains an in-memory buffer for real-time streaming to frontend.
+//
+// CHANGES (v2.1.0):
+// - Added Supabase log queue for persistent storage
+// - Logs are written to: (1) console, (2) daily log file, (3) in-memory buffer, (4) Supabase
+// - Supabase writes are batched and non-blocking to avoid I/O bottlenecks
 // =============================================================================
 
 const fs = require("fs");
@@ -20,6 +25,16 @@ const logBuffer = [];
 const MAX_BUFFER_SIZE = 5000;
 let logSubscribers = [];
 
+// ── Supabase Integration ──
+let supabase = null;
+
+/**
+ * Set the Supabase module reference. Called once at server startup.
+ */
+function setSupabaseModule(sb) {
+  supabase = sb;
+}
+
 function log(level, message) {
   if (LEVELS[level] < currentLevel) return;
 
@@ -27,21 +42,28 @@ function log(level, message) {
   const line = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
   console.log(line);
 
-  // Append to log file
+  // Append to log file (existing behavior)
   try {
     fs.appendFileSync(logFile, line + "\n");
   } catch (_) {}
 
-  // Store in memory buffer for frontend streaming
+  // Store in memory buffer for frontend streaming (existing behavior)
   const entry = { timestamp, level, message };
   logBuffer.push(entry);
   if (logBuffer.length > MAX_BUFFER_SIZE) {
     logBuffer.shift();
   }
 
-  // Notify subscribers (Server-Sent Events)
+  // Notify subscribers (Server-Sent Events) — existing behavior
   for (const sub of logSubscribers) {
     try { sub.write(`data: ${JSON.stringify(entry)}\n\n`); } catch (_) {}
+  }
+
+  // Queue for Supabase persistence (new behavior — non-blocking)
+  if (supabase) {
+    try {
+      supabase.queueLogEntry(entry);
+    } catch (_) {}
   }
 }
 
@@ -65,5 +87,6 @@ module.exports = {
   info:  (msg) => log("info", msg),
   warn:  (msg) => log("warn", msg),
   error: (msg) => log("error", msg),
+  setSupabaseModule,
   subscribeLogStream
 };
