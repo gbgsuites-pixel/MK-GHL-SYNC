@@ -582,8 +582,34 @@
     "Client Last Order": "LdG43OToJ1WFnJjLUsEa",
     "Apt/Suite/Unit": "KX3AFeilb9Hs9n8A46Ng"
      }
+    },
+    {
+  "consultantNum": "Z02587",
+  "password": "Louise01!",
+  "clientName": "Karen Lorenzo",
+  "ghlApiToken": "pit-01cd607c-b78d-4547-8f5d-8a179082fdfd",
+  "ghlLocationId": "ui9U6T0zat68yrihWYIz",
+  "ghlCustomFields": {
+    "Career Level": "nQCz9fmrIQS0Tks6gwxa",
+    "Activity Status": "SmnPpM5Et91n9MZHdoNG",
+    "Consultant Number": "BrjJNNtqCDfpFiXPrb3I",
+    "Language Preference": "hJgnYb5127xcO8XZ8N28",
+    "Additional Phone": "4PZfgeBKFZLQ8BpvoYiE",
+    "Recruiter First Name": "8mJsYq06xgIp9wnW4I2o",
+    "Recruiter Last Name": "eRLxTJKX5LYfmrA8blO2",
+    "Recruiter Consultant Number": "3qIuiQ1KQTrzDvsM8kSo",
+    "Start Date": "KMKwnBoLDKdLK2E04OKP",
+    "Current Wholesale": "pGVsN76feCKlablbnOPl",
+    "Needed for Sapphire": "JNWRAlZuDXMmwcFJecyJ",
+    "Needed for Ruby": "y0skIRDMVpQB4tlUTdnq",
+    "Needed for Diamond": "hyhDraRCNW68BwvQrQz1",
+    "Needed for Emerald": "Wh1kPqb90UlWSUB9Qb6F",
+    "Needed for Pearl": "KRI0wMUZGihJOfcdqrEV",
+    "Client Last Order": "cE0iU65GrEuWXkHyt0S5",
+    "Apt/Suite/Unit": "6mX1JMSafzD3jpxPrEOT"
+      }
     }
-  ],
+],
   "_serverConfig": {
     "_description": "Server-wide settings. API key protects the endpoints. Cron is optional — if true, the server will auto-run the sync at the configured time.",
     "apiKey": "my-local-test-key",
