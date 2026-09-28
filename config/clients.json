@@ -608,6 +608,32 @@
     "Client Last Order": "cE0iU65GrEuWXkHyt0S5",
     "Apt/Suite/Unit": "6mX1JMSafzD3jpxPrEOT"
       }
+    },
+{
+    "consultantNum": "OG7518",
+    "password": "Freedom2024!",
+    "clientName": "Stephanie Mitas",
+    "ghlApiToken": "pit-fecf7a7e-3b80-4456-9c7e-fc65886c5b75",
+    "ghlLocationId": "8duL3qEE5SaeshbDJLRF",
+    "ghlCustomFields": {
+            "Career Level": "nv07NPjM1uMvQN4pH0HT",
+            "Activity Status": "Acxb7qYBZgFwZgqhp5b2",
+            "Consultant Number": "eJnKkQOuk0GSD7HbHhdg",
+            "Language Preference": "NSW9AbRsh7iKixfjs57W",
+            "Additional Phone": "sxcSuNjNABSjc7mwvgpm",
+            "Recruiter First Name": "jPkHdCn42DCmB2ZO0hgH",
+            "Recruiter Last Name": "iW3FL14rF19WOAQp0wcX",
+            "Recruiter Consultant Number": "Ryu9uVU14RBlljh2kzl0",
+            "Start Date": "GdteZiSNtXxe1rH8aCD3",
+            "Current Wholesale": "2A8dpKLWnOqQ6fqnC8VW",
+            "Needed for Sapphire": "cosKqwtf7aDmBbOey336",
+            "Needed for Ruby": "5tuX1SLlnDMD71I24Qe6",
+            "Needed for Diamond": "QQKNSjlAcWmaLZkslX5N",
+            "Needed for Emerald": "8ZwqvgarhvuZ67HyAoSd",
+            "Needed for Pearl": "XxLv29HlqMmxAwLNs7aI",
+            "Client Last Order": "CvlCBQ09pgSTuC2NAkAz",
+            "Apt/Suite/Unit": "vRxILmgMnBTJ7jVUyEN4"
+        }
     }
 ],
   "_serverConfig": {
