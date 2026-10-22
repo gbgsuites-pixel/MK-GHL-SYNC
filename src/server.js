@@ -35,6 +35,19 @@ logger.setSupabaseModule(supabase);
 // Create Express app
 const app = express();
 app.use(express.json());
+let shuttingDown = false;
+let httpServer = null;
+
+// Render can send SIGTERM while an instance is still reachable. Stop new
+// exports/syncs immediately so they cannot start a browser during shutdown.
+app.use((req, res, next) => {
+  if (shuttingDown) {
+    return res.status(503).json({
+      error: "Server is shutting down. Please retry shortly."
+    });
+  }
+  next();
+});
 
 // ── Global Error Handlers — Prevent Puppeteer crashes from killing the process ──
 // Catch unhandled promise rejections (e.g., Puppeteer ProtocolError)
@@ -145,7 +158,7 @@ function startKeepAlive() {
 app.use("/", routes);
 
 // ── Start Server ──
-app.listen(PORT, () => {
+httpServer = app.listen(PORT, () => {
   logger.info(`[Server] Listening on port ${PORT}`);
 
   // Start cron scheduler if configured
@@ -172,25 +185,33 @@ app.listen(PORT, () => {
   logMemoryUsage();
 });
 
-// Graceful shutdown — close all browser sessions and flush Supabase
-process.on("SIGTERM", async () => {
-  logger.info("[Server] SIGTERM received. Shutting down gracefully...");
-  try { await supabase.recordServerEvent("server_shutdown", { reason: "SIGTERM" }); } catch (_) {}
-  await supabase.shutdown();
-  if (keepAliveInterval) clearInterval(keepAliveInterval);
-  if (memoryMonitor) clearInterval(memoryMonitor);
-  await closeAllSessions();
-  process.exit(0);
-});
+// Graceful shutdown — stop accepting requests before closing browser sessions.
+let shutdownPromise = null;
+async function gracefulShutdown(signal) {
+  if (shutdownPromise) return shutdownPromise;
 
-process.on("SIGINT", async () => {
-  logger.info("[Server] SIGINT received. Shutting down gracefully...");
-  try { await supabase.recordServerEvent("server_shutdown", { reason: "SIGINT" }); } catch (_) {}
-  await supabase.shutdown();
-  if (keepAliveInterval) clearInterval(keepAliveInterval);
-  if (memoryMonitor) clearInterval(memoryMonitor);
-  await closeAllSessions();
-  process.exit(0);
-});
+  shutdownPromise = (async () => {
+    shuttingDown = true;
+    logger.info(`[Server] ${signal} received. Shutting down gracefully...`);
+    if (keepAliveInterval) clearInterval(keepAliveInterval);
+    if (memoryMonitor) clearInterval(memoryMonitor);
+
+    // Stop new connections and let any current response finish before the
+    // browser session is closed underneath it.
+    if (httpServer) {
+      await new Promise((resolve) => httpServer.close(resolve));
+    }
+
+    await closeAllSessions();
+    try { await supabase.recordServerEvent("server_shutdown", { reason: signal }); } catch (_) {}
+    try { await supabase.shutdown(); } catch (_) {}
+    process.exit(0);
+  })();
+
+  return shutdownPromise;
+}
+
+process.on("SIGTERM", () => { void gracefulShutdown("SIGTERM"); });
+process.on("SIGINT", () => { void gracefulShutdown("SIGINT"); });
 
 module.exports = app;
