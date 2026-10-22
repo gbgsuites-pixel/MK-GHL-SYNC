@@ -12,6 +12,9 @@
 "use strict";
 
 const puppeteer = require("puppeteer");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 const logger = require("../utils/logger");
 
 const INTOUCH_BASE = process.env.MK_BASE_URL || "https://mk.marykayintouch.com";
@@ -27,6 +30,80 @@ const sessionCache = {};
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function removeUserDataDir(userDataDir) {
+  if (!userDataDir) return;
+  try {
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  } catch (e) {
+    logger.warn(`[Login] Browser profile cleanup failed: ${e.message}`);
+  }
+}
+
+/**
+ * Launch Chromium with container-safe flags. The old --single-process and
+ * --no-zygote flags are intentionally not used: they can make Chromium fail
+ * to start or crash after a Render restart. A second minimal launch profile is
+ * retained as a fallback for small changes in the hosted Chromium runtime.
+ */
+async function launchBrowser(consultantNum) {
+  const candidates = [
+    {
+      label: "standard",
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking"
+      ]
+    },
+    {
+      label: "minimal",
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage"
+      ]
+    }
+  ];
+
+  let lastError;
+
+  for (const candidate of candidates) {
+    const userDataDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), `mk-ghl-${String(consultantNum).toLowerCase()}-`)
+    );
+    const launchOptions = {
+      headless: "new",
+      args: candidate.args,
+      userDataDir,
+      timeout: 60000,
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      handleSIGHUP: false
+    };
+
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+      launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    }
+
+    try {
+      const browser = await puppeteer.launch(launchOptions);
+      logger.info(`[Login] Chromium launched using ${candidate.label} profile.`);
+      return { browser, userDataDir };
+    } catch (e) {
+      lastError = e;
+      removeUserDataDir(userDataDir);
+      logger.warn(`[Login] Chromium ${candidate.label} launch failed: ${e.message}`);
+    }
+  }
+
+  throw new Error(`Chromium launch failed: ${lastError?.message || "unknown launch error"}`);
 }
 
 /**
@@ -88,28 +165,8 @@ function isCacheValid(consultantNum) {
 async function loginAndGetSession(consultantNum, password) {
   logger.info(`[Login] Starting Puppeteer login for: ${consultantNum}`);
 
-  const launchOptions = {
-    headless: "new",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--no-zygote",
-      "--single-process"
-    ]
-  };
-
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    logger.info(`[Login] Using Chromium at: ${process.env.PUPPETEER_EXECUTABLE_PATH}`);
-  }
-
-  const browser = await puppeteer.launch(launchOptions);
-  const page = await browser.newPage();
-  await page.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-  );
+  let browser;
+  let userDataDir = "";
 
   // Capture the token/context from the page's own Aura requests. Do this
   // before the first navigation so the post-login bootstrap request is not
@@ -137,9 +194,19 @@ async function loginAndGetSession(consultantNum, password) {
     if (data.fwuid) capturedAura.fwuid = data.fwuid;
     if (data.appVersion) capturedAura.appVersion = data.appVersion;
   };
-  page.on("request", captureAuraRequest);
 
   try {
+    const launched = await launchBrowser(consultantNum);
+    browser = launched.browser;
+    userDataDir = launched.userDataDir;
+    logger.info(`[Login] Using Chromium at: ${process.env.PUPPETEER_EXECUTABLE_PATH || "Puppeteer default"}`);
+
+    const page = await browser.newPage();
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    );
+    page.on("request", captureAuraRequest);
+
     // ── STEP 1: Navigate to login page ──
     logger.info(`[Login] Navigating to login page...`);
     await page.goto(LOGIN_URL, {
@@ -389,6 +456,7 @@ async function loginAndGetSession(consultantNum, password) {
       consultantNum:    consultantNum,
       page:             page,       // Single page used for both mk and apps domains
       browser:          browser,
+      userDataDir,
       mkUrl:            postLoginUrl,
       appsUrl:          page.url(),
       auraToken,
@@ -400,7 +468,8 @@ async function loginAndGetSession(consultantNum, password) {
     };
 
   } catch (err) {
-    await browser.close();
+    if (browser) await browser.close().catch(() => {});
+    removeUserDataDir(userDataDir);
     throw err;
   }
 }
@@ -466,6 +535,7 @@ async function invalidateSession(consultantNum) {
         logger.warn(`[Session] Browser close error for ${key}: ${e.message}`);
       }
     }
+    removeUserDataDir(entry.session?.userDataDir);
     entry.valid = false;
     delete sessionCache[key];
   }
@@ -483,6 +553,7 @@ async function closeAllSessions() {
         logger.warn(`[Session] Browser close error for ${key}: ${e.message}`);
       }
     }
+    removeUserDataDir(entry?.session?.userDataDir);
     entry.valid = false;
   }
   Object.keys(sessionCache).forEach(k => delete sessionCache[k]);
