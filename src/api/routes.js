@@ -112,13 +112,17 @@ function managedClientResponse(client) {
     id: client.id,
     clientName: client.clientName,
     consultantNum: client.consultantNum,
-    locationId: client.locationId || client.ghlLocationId,
+    locationId: client.locationId,
+    customFieldCount: client.ghlCustomFields && typeof client.ghlCustomFields === "object"
+      ? Object.keys(client.ghlCustomFields).length
+      : 0,
     status: client.status || "active",
     validationStatus: client.validationStatus || "unknown",
     validationErrorCode: client.validationErrorCode || null,
     lastValidationAt: client.lastValidationAt || null,
     lastSyncAt: client.lastSyncAt || null,
     lastSyncStatus: client.lastSyncStatus || null,
+    lastSyncStats: client.lastSyncStats || {},
     createdAt: client.createdAt || null,
     updatedAt: client.updatedAt || null
   };
@@ -209,19 +213,24 @@ router.get("/health", (req, res) => {
 router.get("/api/clients", requireAuth, (req, res) => {
   const clients = getClients();
   res.json({
-    count: clients.length,
-    managed: managedClientsEnabled(),
-    clients: clients.map(c => ({
+      count: clients.length,
+      managed: managedClientsEnabled(),
+      clients: clients.map(c => ({
       id:            c.id || null,
       consultantNum: c.consultantNum,
       clientName:    c.clientName,
-      locationId:    c.ghlLocationId,
+      locationId:    c.locationId,
+      customFieldCount: c.ghlCustomFields && typeof c.ghlCustomFields === "object"
+        ? Object.keys(c.ghlCustomFields).length
+        : 0,
       status:        c.status || "active",
       validationStatus: c.validationStatus || "unknown",
       validationErrorCode: c.validationErrorCode || null,
       lastValidationAt: c.lastValidationAt || null,
       lastSyncAt:    c.lastSyncAt || null,
       lastSyncStatus: c.lastSyncStatus || null,
+      lastSyncStats: c.lastSyncStats || {},
+      createdAt:     c.createdAt || null,
       updatedAt:     c.updatedAt || null
     }))
   });

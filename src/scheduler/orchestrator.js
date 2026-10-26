@@ -50,6 +50,30 @@ async function cleanupClientSession(client) {
   }
 }
 
+async function persistManagedClientSyncResult(client, status, details = {}) {
+  if (!client?.id || typeof supabase.updateManagedClient !== "function") return;
+  const stats = details.stats || {};
+  try {
+    await supabase.updateManagedClient(client.id, {
+      lastSyncAt: new Date().toISOString(),
+      lastSyncStatus: status,
+      lastSyncStats: {
+        contacts: Number(details.contacts) || 0,
+        synced: Number(details.synced) || 0,
+        errors: Number(details.errors) || 0,
+        skipped: Number(details.skipped) || 0,
+        consultants: Number(stats.consultantListCount) || 0,
+        customers: Number(stats.customerListCount) || 0,
+        message: details.message || null,
+        protectedFieldAlerts: details.protectedFieldAlerts || stats.protectedFieldAlerts || [],
+        protectedFields: details.protectedFieldStats || stats.protectedFieldStats || {}
+      }
+    });
+  } catch (error) {
+    logger.warn(`[Orchestrator] Could not persist last-sync metrics for ${client.clientName}: ${error.message}`);
+  }
+}
+
 /**
  * Safe wrapper to ensure the orchestrator never crashes from Puppeteer errors.
  * All client processing is wrapped in a try/catch that logs and continues.
@@ -162,6 +186,14 @@ async function runFullSync(clients) {
         clientEntry.status = blocked ? "blocked" : "no_contacts";
         clientEntry.error = reason;
         failClient(client.clientName, reason);
+        await persistManagedClientSyncResult(client, clientEntry.status, {
+          contacts: 0,
+          errors: blocked ? 1 : 0,
+          message: reason,
+          stats,
+          protectedFieldAlerts: stats.protectedFieldAlerts,
+          protectedFieldStats: stats.protectedFieldStats
+        });
 
         // ── Supabase: Complete client result ──
         try {
@@ -187,7 +219,7 @@ async function runFullSync(clients) {
       const ghlResult = await syncToGhl(
         {
           apiToken:    client.ghlApiToken,
-          locationId:  client.ghlLocationId,
+          locationId:  client.locationId,
           customFields: client.ghlCustomFields
         },
         contacts,
@@ -214,6 +246,15 @@ async function runFullSync(clients) {
       stats.ghlErrors = ghlResult.errors.length;
 
       completeClient(client.clientName, stats, ghlResult);
+      await persistManagedClientSyncResult(client, clientEntry.status, {
+        contacts: contacts.length,
+        synced: ghlResult.synced,
+        errors: ghlResult.errors.length,
+        skipped: ghlResult.skipped || stats.skipped || 0,
+        stats,
+        protectedFieldAlerts: stats.protectedFieldAlerts,
+        protectedFieldStats: stats.protectedFieldStats
+      });
 
       logger.info(`\n>>> ${client.clientName} ${clientEntry.status.toUpperCase()}:`, {
         category: "upload",
@@ -255,6 +296,14 @@ async function runFullSync(clients) {
       clientEntry.status = "failed";
       clientEntry.error = e.message;
       failClient(client.clientName, e.message);
+      await persistManagedClientSyncResult(client, "failed", {
+        contacts: 0,
+        errors: 1,
+        message: e.message,
+        stats: clientEntry.stats || {},
+        protectedFieldAlerts: clientEntry.stats?.protectedFieldAlerts,
+        protectedFieldStats: clientEntry.stats?.protectedFieldStats
+      });
       logger.error(`>>> ${client.clientName} FAILED: ${e.message}`, {
         category: "sync",
         operation: "client_sync",
@@ -265,36 +314,16 @@ async function runFullSync(clients) {
         retryable: Boolean(e.retryable)
       });
 
-      // ── Supabase: Record failure ──
+      // ── Supabase: Record failure
       try {
         await supabase.completeClientResult(currentExecutionId, client.clientName, client.consultantNum, null, null, e.message);
       } catch (_) {}
-    }
 
-    currentExecution.clients.push(clientEntry);
-    results.push(clientEntry);
-
-    // Close browser session and free memory after every completed/failed client.
-    await cleanupClientSession(client);
-
-    // Log memory after cleanup
-    const memAfter = process.memoryUsage();
-    const rssAfter = Math.round(memAfter.rss / 1024 / 1024);
-    const freed = rssBefore - rssAfter;
-    logger.info(`[Orchestrator] Post-cleanup memory: ${rssAfter}MB (freed ${freed}MB)`);
-
-    // ── Memory Safety: Force close ALL sessions if memory is critically high ──
-    // This is a safety net for the cumulative memory leak across clients
-    const rssMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
-    const MEMORY_LIMIT_MB = parseInt(process.env.MEMORY_LIMIT_MB) || 1500;
-    if (rssMB > MEMORY_LIMIT_MB) {
-      logger.warn(`[Orchestrator] WARNING: Memory at ${rssMB}MB exceeds safety limit of ${MEMORY_LIMIT_MB}MB.`);
-      logger.warn(`[Orchestrator] Closing ALL browser sessions to prevent OOM crash...`);
-      try {
-        await closeAllSessions();
-      } catch (e) {
-        logger.warn(`[Orchestrator] Force close all sessions error: ${e.message}`);
-      }
+    } finally {
+      // Always clean up this client's browser session, regardless of outcome
+      await cleanupClientSession(client);
+      currentExecution.clients.push(clientEntry);
+      results.push(clientEntry);
     }
   }
 

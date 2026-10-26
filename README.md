@@ -185,6 +185,31 @@ validation action to run the read-only Mary Kay session check. Only `active`
 clients participate in manual full syncs and scheduled syncs. `paused`,
 `invalid`, `disconnected`, and `removal_pending` clients are excluded.
 
+### Protected custom-field safety guard
+
+The sync performs a read-only GHL custom-field preflight for these protected
+fields before any contact upload:
+
+```text
+Activity Status
+Current Wholesale
+Career Level
+Client Last Order
+Needed for Sapphire
+Needed for Ruby
+Needed for Diamond
+Needed for Emerald
+Needed for Pearl
+```
+
+If a protected field is missing from the stored mapping, missing from the live
+GHL location, or its mapping ID changed, the client sync is blocked before GHL
+upload. The service also compares protected-field source availability with the
+previous sync and blocks when a previously populated field suddenly returns no
+values. The affected field names are recorded as critical logs and shown in
+the dashboard client error/details panels. A successful subsequent sync clears
+the prior alert.
+
 ### Structured operational logs
 
 Apply `migrations/VA-3379 - structured_log_events.sql` to add filterable event

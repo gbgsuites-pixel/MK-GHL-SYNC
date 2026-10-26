@@ -84,13 +84,14 @@ function safeManagedClient(record) {
     clientName: record.client_name || record.clientName,
     consultantNum: record.consultant_num || record.consultantNum,
     consultantNumMasked: mask(record.consultant_num || record.consultantNum, 2),
-    locationId: record.ghl_location_id || record.ghlLocationId,
+    locationId: record.ghl_location_id,
     status: record.status || "active",
     validationStatus: record.validation_status || "unknown",
     validationErrorCode: record.validation_error_code || null,
     lastValidationAt: record.last_validation_at || null,
     lastSyncAt: record.last_sync_at || null,
     lastSyncStatus: record.last_sync_status || null,
+    lastSyncStats: record.last_sync_stats || record.lastSyncStats || {},
     createdAt: record.created_at || null,
     updatedAt: record.updated_at || null
   };

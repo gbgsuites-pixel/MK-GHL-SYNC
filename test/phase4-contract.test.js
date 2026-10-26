@@ -12,6 +12,11 @@ const {
   normalizeCustomFields,
   customFieldMap,
 } = require('../src/core/ghlAdmin');
+const {
+  PROTECTED_CUSTOM_FIELDS,
+  compareProtectedFieldMapping,
+  inspectProtectedFieldSource,
+} = require('../src/core/protectedFields');
 const { buildCustomFieldsPayload } = require('../src/sync/ghlSync');
 const config = require('../src/core/config');
 const { _withSessionLock } = require('../src/sessions/sessionManager');
@@ -51,6 +56,21 @@ test('managed client routes support GHL onboarding and permanent removal', () =>
   assert.match(routes, /input\.ghlCustomFields = customFieldMap\(customFields\)/);
   assert.match(routes, /router\.delete\("\/api\/v1\/clients\/:id\/permanent"/);
   assert.match(routes, /supabase\.deleteManagedClient\(req\.params\.id\)/);
+});
+
+test('protected fields block mapping drift and detect an interrupted source field', () => {
+  const stored = Object.fromEntries(PROTECTED_CUSTOM_FIELDS.map((name) => [name, `stored-${name}`]));
+  const live = { ...stored, 'Activity Status': 'live-activity-status' };
+  const mapping = compareProtectedFieldMapping(stored, live);
+  assert.equal(mapping.ok, false);
+  assert.equal(mapping.changedIds[0].fieldName, 'Activity Status');
+
+  const contacts = PROTECTED_CUSTOM_FIELDS.map((fieldName) => ({ customFields: { [fieldName]: fieldName === 'Current Wholesale' ? undefined : 'current' } }));
+  const source = inspectProtectedFieldSource(contacts, {
+    protectedFields: { 'Current Wholesale': { providedCount: 5 } },
+  });
+  assert.equal(source.ok, false);
+  assert.match(source.alerts[0], /Current Wholesale/);
 });
 
 test('GHL payload keeps only mapped non-empty custom fields', () => {

@@ -1,0 +1,96 @@
+const PROTECTED_CUSTOM_FIELDS = [
+  "Activity Status",
+  "Current Wholesale",
+  "Career Level",
+  "Client Last Order",
+  "Needed for Sapphire",
+  "Needed for Ruby",
+  "Needed for Diamond",
+  "Needed for Emerald",
+  "Needed for Pearl"
+];
+
+function normalizeFieldMap(value) {
+  return value && typeof value === "object" ? value : {};
+}
+
+function compareProtectedFieldMapping(storedMap, liveMap) {
+  const stored = normalizeFieldMap(storedMap);
+  const live = normalizeFieldMap(liveMap);
+  const missingFromStored = [];
+  const missingFromLive = [];
+  const changedIds = [];
+
+  for (const fieldName of PROTECTED_CUSTOM_FIELDS) {
+    if (!stored[fieldName]) missingFromStored.push(fieldName);
+    if (!live[fieldName]) missingFromLive.push(fieldName);
+    if (stored[fieldName] && live[fieldName] && stored[fieldName] !== live[fieldName]) {
+      changedIds.push({ fieldName, storedId: stored[fieldName], liveId: live[fieldName] });
+    }
+  }
+
+  const alerts = [];
+  if (missingFromStored.length > 0) {
+    alerts.push(`Protected fields are missing from the stored mapping: ${missingFromStored.join(", ")}.`);
+  }
+  if (missingFromLive.length > 0) {
+    alerts.push(`Protected fields are missing from the live GHL location: ${missingFromLive.join(", ")}.`);
+  }
+  if (changedIds.length > 0) {
+    alerts.push(`Protected field IDs changed in GHL: ${changedIds.map(item => item.fieldName).join(", ")}.`);
+  }
+
+  return {
+    ok: alerts.length === 0,
+    missingFromStored,
+    missingFromLive,
+    changedIds,
+    alerts
+  };
+}
+
+function inspectProtectedFieldSource(contacts, previousSyncStats = {}) {
+  const rows = Array.isArray(contacts) ? contacts : [];
+  const previous = previousSyncStats?.protectedFields || {};
+  const protectedFields = {};
+  const alerts = [];
+
+  for (const fieldName of PROTECTED_CUSTOM_FIELDS) {
+    let providedCount = 0;
+    let blankCount = 0;
+
+    for (const contact of rows) {
+      const value = contact?.customFields?.[fieldName];
+      if (value === undefined || value === null || String(value).trim() === "") blankCount++;
+      else providedCount++;
+    }
+
+    const previousProvidedCount = Number(previous[fieldName]?.providedCount) || 0;
+    const interrupted = rows.length > 0 && providedCount === 0 && previousProvidedCount > 0;
+    protectedFields[fieldName] = {
+      contactCount: rows.length,
+      providedCount,
+      blankCount,
+      previousProvidedCount,
+      interrupted
+    };
+
+    if (interrupted) {
+      alerts.push(
+        `${fieldName} returned no values for ${rows.length} contacts; the previous sync had ${previousProvidedCount} populated value(s).`
+      );
+    }
+  }
+
+  return {
+    ok: alerts.length === 0,
+    protectedFields,
+    alerts
+  };
+}
+
+module.exports = {
+  PROTECTED_CUSTOM_FIELDS,
+  compareProtectedFieldMapping,
+  inspectProtectedFieldSource
+};

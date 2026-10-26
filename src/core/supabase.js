@@ -482,6 +482,7 @@ const MANAGED_CLIENT_SELECT = [
   "last_validation_at",
   "last_sync_at",
   "last_sync_status",
+  "last_sync_stats",
   "created_at",
   "updated_at"
 ].join(",");
@@ -593,6 +594,7 @@ async function updateManagedClient(id, patch = {}) {
   if (patch.lastValidationAt !== undefined) updates.last_validation_at = patch.lastValidationAt;
   if (patch.lastSyncAt !== undefined) updates.last_sync_at = patch.lastSyncAt;
   if (patch.lastSyncStatus !== undefined) updates.last_sync_status = patch.lastSyncStatus;
+  if (patch.lastSyncStats !== undefined) updates.last_sync_stats = patch.lastSyncStats;
   if (patch.password !== undefined || patch.ghlApiToken !== undefined) {
     const current = await getManagedClient(id, { includeSecrets: true });
     if (!current) return null;

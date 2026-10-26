@@ -21,6 +21,11 @@ const {
   parseRecruiterInfo,
   getStarConsultantQuarterInfo
 } = require("../utils/dataHelpers");
+const { fetchLocationCustomFields, customFieldMap } = require("../core/ghlAdmin");
+const {
+  compareProtectedFieldMapping,
+  inspectProtectedFieldSource
+} = require("../core/protectedFields");
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -682,8 +687,44 @@ async function processClient(client) {
     mergedContacts:      0,
     ghlSynced:           0,
     ghlErrors:           0,
-    errors:              []
+    errors:              [],
+    protectedFieldAlerts: []
   };
+
+  // Fail closed before opening a Mary Kay session or uploading contacts when
+  // the nine protected fields no longer match the live GHL location.
+  try {
+    const liveFields = await fetchLocationCustomFields(
+      client.ghlApiToken,
+      client.locationId
+    );
+    const mappingCheck = compareProtectedFieldMapping(
+      client.ghlCustomFields,
+      customFieldMap(liveFields)
+    );
+    stats.protectedFieldMapping = mappingCheck;
+    if (!mappingCheck.ok) {
+      stats.blocked = true;
+      stats.errorCode = "PROTECTED_FIELD_MAPPING_FAILED";
+      stats.protectedFieldAlerts = mappingCheck.alerts;
+      stats.errors.push(...mappingCheck.alerts);
+      logger.critical(
+        `[Protected Fields] Blocking GHL upload for ${client.clientName}: ${mappingCheck.alerts.join(" ")}`,
+        { category: "validation", operation: "protected_field_mapping", status: "blocked", clientId: client.id || client.consultantNum }
+      );
+      return { contacts: [], stats };
+    }
+  } catch (e) {
+    stats.blocked = true;
+    stats.errorCode = e.code || "PROTECTED_FIELD_MAPPING_FAILED";
+    stats.protectedFieldAlerts = [e.message];
+    stats.errors.push(`Protected field validation failed: ${e.message}`);
+    logger.critical(
+      `[Protected Fields] Blocking GHL upload for ${client.clientName}: ${e.message}`,
+      { category: "validation", operation: "protected_field_mapping", status: "blocked", clientId: client.id || client.consultantNum, errorCode: stats.errorCode }
+    );
+    return { contacts: [], stats };
+  }
 
   // 1. Get live session (Puppeteer page)
   let pageSession;
@@ -766,6 +807,20 @@ async function processClient(client) {
 
   // 7. Build GHL contacts
   const contacts = buildGhlContacts(masterMap, keyOrder);
+
+  const sourceCheck = inspectProtectedFieldSource(contacts, client.lastSyncStats);
+  stats.protectedFieldStats = sourceCheck.protectedFields;
+  stats.protectedFieldAlerts = sourceCheck.alerts;
+  if (!sourceCheck.ok) {
+    stats.blocked = true;
+    stats.errorCode = "PROTECTED_FIELD_INTERRUPTION";
+    stats.errors.push(...sourceCheck.alerts);
+    logger.critical(
+      `[Protected Fields] Blocking GHL upload for ${client.clientName}: ${sourceCheck.alerts.join(" ")}`,
+      { category: "validation", operation: "protected_field_source", status: "blocked", clientId: client.id || client.consultantNum, errorCode: stats.errorCode }
+    );
+    return { contacts: [], stats };
+  }
 
   logger.info(`Client ${client.clientName} exports COMPLETE.`);
   return { contacts, stats };
