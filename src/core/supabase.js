@@ -621,6 +621,19 @@ async function updateManagedClient(id, patch = {}) {
   return updated ? rowToManagedClient(updated, false) : getManagedClient(id, { includeSecrets: false });
 }
 
+async function deleteManagedClient(id) {
+  ensureSupabaseForManagedClients();
+  const client = supabaseClient();
+  const response = await client.delete(
+    `/rest/v1/integration_clients?id=eq.${encodeURIComponent(id)}`,
+    { headers: { Prefer: "return=minimal" } }
+  );
+  if (response.status >= 300) {
+    throw new Error(`Managed client removal failed with HTTP ${response.status}.`);
+  }
+  return true;
+}
+
 async function loadManagedClients() {
   return listManagedClients({ includeSecrets: true });
 }
@@ -652,5 +665,6 @@ module.exports = {
   getManagedClient,
   createManagedClient,
   updateManagedClient,
-  loadManagedClients
+  deleteManagedClient,
+  loadManagedClients,
 };

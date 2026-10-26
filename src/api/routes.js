@@ -257,11 +257,24 @@ router.post("/api/v1/clients", requireAuth, requireManagedClients, async (req, r
         code: "DUPLICATE_CLIENT_IDENTITY"
       });
     }
+    // Fetch the location's current GHL custom fields during onboarding so the
+    // mapping is stored with the encrypted client record before first sync.
+    const customFields = await fetchLocationCustomFields(
+      input.ghlApiToken,
+      input.ghlLocationId
+    );
+    input.ghlCustomFields = customFieldMap(customFields);
     const created = await supabase.createManagedClient(input);
     await refreshManagedClientCache();
-    res.status(201).json({ client: managedClientResponse(created), status: "pending_validation" });
+    res.status(201).json({
+      client: managedClientResponse(created),
+      status: "pending_validation",
+      customFieldCount: customFields.length
+    });
   } catch (e) {
-    const status = e.code === "DUPLICATE_CLIENT_IDENTITY" ? 409 : 400;
+    const status = e.code === "DUPLICATE_CLIENT_IDENTITY"
+      ? 409
+      : (e.code?.startsWith("GHL_") || e.code === "CUSTOM_FIELDS_UNAVAILABLE") ? 422 : 400;
     res.status(status).json({ error: e.message, code: e.code || "CLIENT_CREATE_FAILED" });
   }
 });
@@ -343,6 +356,22 @@ router.delete("/api/v1/clients/:id", requireAuth, requireManagedClients, async (
     res.json({ status: "disconnected", client: managedClientResponse(updated) });
   } catch (e) {
     res.status(500).json({ error: e.message, code: e.code || "CLIENT_DISCONNECT_FAILED" });
+  }
+});
+
+// Permanently remove only the integration client row. Historical sync
+// executions, contact results, logs, and audit records remain available.
+router.delete("/api/v1/clients/:id/permanent", requireAuth, requireManagedClients, async (req, res) => {
+  try {
+    const client = await supabase.getManagedClient(req.params.id, { includeSecrets: true });
+    if (!client) return res.status(404).json({ error: "Managed client not found." });
+    await invalidateSession(client.consultantNum);
+    await supabase.deleteManagedClient(req.params.id);
+    await refreshManagedClientCache();
+    logger.info(`[API] Managed client permanently removed: ${client.clientName}`);
+    res.json({ status: "removed", consultantNum: client.consultantNum });
+  } catch (e) {
+    res.status(500).json({ error: e.message, code: e.code || "CLIENT_REMOVE_FAILED" });
   }
 });
 

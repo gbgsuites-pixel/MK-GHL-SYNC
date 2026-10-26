@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const {
   encryptSecrets,
@@ -41,6 +43,14 @@ test('custom-field normalization returns a stable name-to-ID map', () => {
     'Career Level': 'field-career',
     'Current Wholesale': 'field-wholesale',
   });
+});
+
+test('managed client routes support GHL onboarding and permanent removal', () => {
+  const routes = fs.readFileSync(path.join(__dirname, '../src/api/routes.js'), 'utf8');
+  assert.match(routes, /fetchLocationCustomFields\(\s*input\.ghlApiToken/);
+  assert.match(routes, /input\.ghlCustomFields = customFieldMap\(customFields\)/);
+  assert.match(routes, /router\.delete\("\/api\/v1\/clients\/:id\/permanent"/);
+  assert.match(routes, /supabase\.deleteManagedClient\(req\.params\.id\)/);
 });
 
 test('GHL payload keeps only mapped non-empty custom fields', () => {

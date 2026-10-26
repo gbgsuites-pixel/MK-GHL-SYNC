@@ -173,13 +173,17 @@ POST   /api/v1/clients
 POST   /api/v1/clients/:id/validate-credentials
 PATCH  /api/v1/clients/:id/status
 DELETE /api/v1/clients/:id       # soft-disconnects; it does not hard-delete history
+DELETE /api/v1/clients/:id/permanent # removes the integration row; history remains
 POST   /api/v1/clients/:id/sync
 ```
 
-New clients start as `pending_validation`. Validation performs a read-only Mary
-Kay session check and a read-only GoHighLevel custom-field lookup. Only
-validated `active` clients participate in manual full syncs and scheduled syncs.
-`paused`, `invalid`, `disconnected`, and `removal_pending` clients are excluded.
+Creating a client requires `clientName`, `consultantNum`, `password`,
+`ghlApiToken`, and `ghlLocationId`. The create endpoint performs a read-only
+GoHighLevel custom-field lookup and stores the returned name-to-ID map with the
+encrypted client record. New clients start as `pending_validation`; use the
+validation action to run the read-only Mary Kay session check. Only `active`
+clients participate in manual full syncs and scheduled syncs. `paused`,
+`invalid`, `disconnected`, and `removal_pending` clients are excluded.
 
 ### Structured operational logs
 
