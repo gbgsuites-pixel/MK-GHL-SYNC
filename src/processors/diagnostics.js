@@ -156,6 +156,22 @@ async function fetchProcessedContacts(client) {
     }
   };
 
+  // Never generate a successful-looking CSV from a partial source fetch. The
+  // dashboard route already returns HTTP 500 when this function returns an
+  // error, so the frontend can show the real source failure instead of letting
+  // incomplete contacts reach GHL.
+  const sourceErrors = Object.entries(result.dataFetch.errors)
+    .filter(([, error]) => Boolean(error));
+
+  if (sourceErrors.length > 0) {
+    const details = sourceErrors
+      .map(([source, error]) => `${source}: ${error}`)
+      .join("; ");
+    result.error = `Source data fetch failed; export blocked to prevent partial data: ${details}`;
+    logger.error(`[Diagnostics] ${result.error}`);
+    return result;
+  }
+
   // Merge and build contacts
   try {
     const { masterMap, keyOrder } = mergeAllData(

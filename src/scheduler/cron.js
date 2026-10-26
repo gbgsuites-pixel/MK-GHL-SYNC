@@ -4,11 +4,12 @@
 // =============================================================================
 
 const cron = require("node-cron");
-const { getClients, getServerConfig } = require("../core/config");
+const { getActiveClients, getServerConfig } = require("../core/config");
 const { runFullSync } = require("./orchestrator");
 const logger = require("../utils/logger");
 
 let cronJob = null;
+let activeSchedule = null;
 
 /**
  * Start the cron scheduler if configured.
@@ -18,6 +19,7 @@ function startCron() {
   const schedule = config.schedule || {};
 
   if (!schedule.enabled) {
+    stopCron();
     logger.info("[Cron] Scheduled sync is disabled.");
     return;
   }
@@ -31,12 +33,21 @@ function startCron() {
     return;
   }
 
+  if (cronJob && activeSchedule && activeSchedule.cron === cronExpression && activeSchedule.timezone === timezone) {
+    logger.debug(`[Cron] Scheduler already active: "${cronExpression}" (${timezone}).`);
+    return;
+  }
+
+  if (cronJob) {
+    stopCron();
+  }
+
   logger.info(`[Cron] Starting scheduled sync: "${cronExpression}" (${timezone})`);
 
   cronJob = cron.schedule(cronExpression, async () => {
     logger.info(`[Cron] Scheduled sync triggered.`);
     try {
-      const clients = getClients();
+      const clients = getActiveClients();
       await runFullSync(clients);
     } catch (e) {
       logger.error(`[Cron] Scheduled sync failed: ${e.message}`);
@@ -47,6 +58,7 @@ function startCron() {
   });
 
   cronJob.start();
+  activeSchedule = { cron: cronExpression, timezone };
 }
 
 /**
@@ -55,7 +67,9 @@ function startCron() {
 function stopCron() {
   if (cronJob) {
     cronJob.stop();
+    if (typeof cronJob.destroy === "function") cronJob.destroy();
     cronJob = null;
+    activeSchedule = null;
     logger.info("[Cron] Scheduled sync stopped.");
   }
 }
@@ -71,5 +85,7 @@ function restartCron() {
 module.exports = {
   startCron,
   stopCron,
-  restartCron
+  restartCron,
+  isRunning: () => Boolean(cronJob),
+  getActiveSchedule: () => activeSchedule ? { ...activeSchedule } : null
 };

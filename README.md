@@ -103,7 +103,14 @@ npm start
 |----------|-------------|---------|
 | `PORT` | Server port (Render sets this automatically) | `3000` |
 | `API_SECRET_KEY` | Secret key for API authentication | `your-secret-key-here` |
-| `CONFIG_PATH` | Path to the clients config file | `./config/clients.json` |
+| `CLIENTS_CONFIG_JSON` | Secret-managed JSON containing client credentials and field mappings | runtime secret only |
+| `CONFIG_PATH` | External path to the clients config file; do not point production at the repository file | runtime-injected path |
+| `REQUIRE_EXTERNAL_CLIENT_CONFIG` | Reject repository-bundled credentials when true | `true` in production |
+| `FRONTEND_ORIGINS` | Comma-separated exact dashboard origins allowed by CORS | runtime setting |
+| `SCHEDULE_CONFIG_PATH` | Writable schedule state path when clients are loaded from secret JSON | `./runtime/schedule.json` |
+| `MANAGED_CLIENTS_ENABLED` | Enable encrypted Supabase-backed client management after migration | `false` |
+| `MANAGED_CLIENTS_FALLBACK_CONFIG_PATH` | Optional external backup used if Supabase hydration fails during cutover; never use the tracked config file | `/secure/backups/clients.json` |
+| `CLIENT_SECRET_ENCRYPTION_KEY` | Runtime-only key used to encrypt Mary Kay/GHL credentials at rest | secret |
 | `LOG_LEVEL` | Logging verbosity | `info` |
 | `GHL_CHUNK_SIZE` | Contacts per GHL API batch | `50` |
 | `SESSION_TTL_HOURS` | Session cache duration | `23` |
@@ -113,7 +120,10 @@ npm start
 
 ### Adding Clients
 
-Edit `config/clients.json` and add a new entry to the `clients` array:
+For local development only, copy `config/clients.example.json` to the ignored
+`config/clients.json` and add an entry to the `clients` array. Production must
+provide the full client configuration through `CLIENTS_CONFIG_JSON` or an
+external `CONFIG_PATH`; never commit the populated file.
 
 ```json
 {
@@ -145,9 +155,71 @@ Edit the `_serverConfig` section in `config/clients.json`:
 
 After editing config, restart the server or call `POST /api/config/reload`.
 
+### Supabase-managed clients
+
+Phase 2 adds encrypted client management in `migrations/VA-3379 - integration_clients.sql`.
+Run that migration in the Supabase SQL editor, set `SUPABASE_URL`, `SUPABASE_KEY`,
+`CLIENT_SECRET_ENCRYPTION_KEY`, and `MANAGED_CLIENTS_ENABLED=true`, then restart
+the backend. The service hydrates the managed client records before starting
+cron. Passwords and GHL private integration keys are encrypted with AES-256-GCM
+before being written to Supabase and are never returned to the frontend.
+
+The managed lifecycle endpoints are:
+
+```text
+GET    /api/v1/clients
+GET    /api/v1/clients/:id
+POST   /api/v1/clients
+POST   /api/v1/clients/:id/validate-credentials
+PATCH  /api/v1/clients/:id/status
+DELETE /api/v1/clients/:id       # soft-disconnects; it does not hard-delete history
+POST   /api/v1/clients/:id/sync
+```
+
+New clients start as `pending_validation`. Validation performs a read-only Mary
+Kay session check and a read-only GoHighLevel custom-field lookup. Only
+validated `active` clients participate in manual full syncs and scheduled syncs.
+`paused`, `invalid`, `disconnected`, and `removal_pending` clients are excluded.
+
+### Structured operational logs
+
+Apply `migrations/VA-3379 - structured_log_events.sql` to add filterable event
+fields to the existing `server_logs` table. The logger writes redacted JSONL
+events with an event ID, timestamp, level, category, client/execution context,
+operation, status, error code, retryability, and bounded metadata. Local files
+rotate by UTC date, and Supabase log batches are serialized, retried, and
+drained during shutdown. If the additive migration has not reached a rolling
+instance yet, the writer falls back to the legacy timestamp/level/message
+columns rather than dropping the event.
+
+The dashboard can query durable events through:
+
+```text
+GET /api/v1/log-events?limit=200&level=error&category=upload&status=failed&retryable=true&clientId=...&executionId=...&since=...&until=...
+```
+
+All filters are validated and bounded. The legacy `/api/logs/recent` endpoint
+remains available and now uses the same structured/local fallback path.
+
+### Supabase client runtime
+
+The backend only reads encrypted managed clients from the existing
+`integration_clients` table. Client-data conversion is intentionally kept out
+of this repository. Use the separately delivered standalone converter
+`VA-3379 - clients.json to Supabase SQL.js` to generate an import SQL file
+locally. The converter never contacts Supabase, rejects non-identical duplicate
+identities, collapses exact duplicates, and encrypts Mary Kay/GHL credentials
+with `CLIENT_SECRET_ENCRYPTION_KEY` before writing SQL. Run the generated SQL
+once in the Supabase SQL Editor, then configure the same permanent encryption
+key in the backend runtime.
+
 ## API Endpoints
 
-All endpoints (except `/health`) require the `x-api-key` header matching `API_SECRET_KEY`.
+All REST endpoints (except `/health`) require the `x-api-key` header matching
+`API_SECRET_KEY`. Log and progress SSE streams require a short-lived ticket
+obtained from `POST /api/stream-ticket`; long-lived API keys are never placed
+in stream URLs. Query-string API-key compatibility is disabled by default and
+should remain disabled in production.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -166,6 +238,7 @@ All endpoints (except `/health`) require the `x-api-key` header matching `API_SE
 | GET | `/api/export/lists/:consultantNum` | Export raw lists as JSON |
 | GET | `/api/export/ghl-contacts/:consultantNum` | Export GHL contacts as JSON |
 | GET | `/api/export/ghl-csv/:consultantNum` | Export GHL contacts as CSV download |
+| POST | `/api/stream-ticket` | Exchange the API key for a short-lived logs/progress SSE ticket |
 
 ### Example API Calls
 

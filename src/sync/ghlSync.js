@@ -12,7 +12,10 @@ const axios = require("axios");
 const logger = require("../utils/logger");
 
 const GHL_API_BASE = "https://services.leadconnectorhq.com";
-const CHUNK_SIZE = parseInt(process.env.GHL_CHUNK_SIZE) || 50;
+const configuredChunkSize = parseInt(process.env.GHL_CHUNK_SIZE, 10);
+const CHUNK_SIZE = Number.isInteger(configuredChunkSize) && configuredChunkSize > 0
+  ? configuredChunkSize
+  : 50;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -169,6 +172,8 @@ async function syncToGhl(ghlConfig, contacts, listName, options = {}) {
   const total = contacts.length;
   let cursor = resumeFrom;
   const allErrors = [];
+  let totalSynced = 0;
+  let totalSkipped = 0;
 
   logger.info(`[GHL Sync] Queuing ${total} contacts for chunked sync...`);
 
@@ -176,6 +181,7 @@ async function syncToGhl(ghlConfig, contacts, listName, options = {}) {
     const chunkEnd = Math.min(cursor + CHUNK_SIZE, total);
     let successCount = 0;
     let skippedCount = 0;
+    const errorsBeforeChunk = allErrors.length;
 
     logger.info(`[GHL Sync] Processing chunk: contacts ${cursor + 1} to ${chunkEnd} of ${total}...`);
 
@@ -220,7 +226,9 @@ async function syncToGhl(ghlConfig, contacts, listName, options = {}) {
       await sleep(500);
     }
 
-    const chunkErrors = allErrors.length - (chunkEnd > cursor ? 0 : 0);
+    const chunkErrors = allErrors.length - errorsBeforeChunk;
+    totalSynced += successCount;
+    totalSkipped += skippedCount;
 
     logger.info(`[GHL Sync] Chunk done. Processed ${chunkEnd - cursor} contacts ` +
       `(${successCount} ok, ${skippedCount} skipped, ${chunkErrors} errors). ` +
@@ -233,8 +241,8 @@ async function syncToGhl(ghlConfig, contacts, listName, options = {}) {
       onProgress({
         cursor,
         total,
-        synced: successCount,
-        skipped: skippedCount,
+        synced: totalSynced,
+        skipped: totalSkipped,
         chunkErrors
       });
     }
@@ -257,8 +265,9 @@ async function syncToGhl(ghlConfig, contacts, listName, options = {}) {
   }
 
   return {
-    synced:   total - allErrors.length,
-    skipped:  contacts.filter(c => !c.email && !c.phone).length,
+    synced:   totalSynced,
+    skipped:  totalSkipped,
+    failed:   allErrors.length,
     errors:   allErrors,
     total
   };

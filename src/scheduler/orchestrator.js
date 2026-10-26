@@ -28,7 +28,8 @@ let currentExecutionId = null; // Supabase execution ID
 function getExecutionState() {
   if (!currentExecution) return null;
   return {
-    status:     isRunning ? "running" : "completed",
+    status:     isRunning ? "running" : (currentExecution.status || "completed"),
+    executionId: currentExecution.executionId || currentExecutionId,
     startTime:  currentExecution.startTime,
     clients:    currentExecution.clients.map(c => ({
       name:        c.name,
@@ -37,6 +38,16 @@ function getExecutionState() {
       ghlResult:   c.ghlResult
     }))
   };
+}
+
+async function cleanupClientSession(client) {
+  try {
+    logger.info(`[Orchestrator] Closing browser session for ${client.clientName}...`);
+    await invalidateSession(client.consultantNum);
+    if (global.gc) global.gc();
+  } catch (cleanupErr) {
+    logger.warn(`[Orchestrator] Browser cleanup for ${client.clientName} had issues: ${cleanupErr.message}`);
+  }
 }
 
 /**
@@ -63,6 +74,7 @@ async function runFullSync(clients) {
   // ── Supabase: Create execution record ──
   try {
     currentExecutionId = await supabase.createExecution("cron", clients.length);
+    currentExecution.executionId = currentExecutionId;
     if (currentExecutionId) {
       await supabase.recordServerEvent("sync_started", {
         total_clients: clients.length,
@@ -75,8 +87,18 @@ async function runFullSync(clients) {
   }
 
   logger.info(`\n═══════════════════════════════════════════════════════`);
-  logger.info(`[Orchestrator] Full sync started at ${execStartTime.toISOString()}`);
-  logger.info(`[Orchestrator] Processing ${clients.length} client(s)`);
+  logger.info(`[Orchestrator] Full sync started at ${execStartTime.toISOString()}`, {
+    category: "sync",
+    operation: "full_sync",
+    status: "started",
+    executionId: currentExecutionId
+  });
+  logger.info(`[Orchestrator] Processing ${clients.length} client(s)`, {
+    category: "sync",
+    operation: "client_batch",
+    executionId: currentExecutionId,
+    metadata: { totalClients: clients.length }
+  });
   logger.info(`═══════════════════════════════════════════════════════\n`);
 
   const results = [];
@@ -93,12 +115,25 @@ async function runFullSync(clients) {
     // Log memory before each client to track accumulation
     const memBefore = process.memoryUsage();
     const rssBefore = Math.round(memBefore.rss / 1024 / 1024);
-    logger.info(`[Orchestrator] Client ${clientIndex + 1}/${clients.length}: ${client.clientName} (Memory: ${rssBefore}MB)`);
+    logger.info(`[Orchestrator] Client ${clientIndex + 1}/${clients.length}: ${client.clientName} (Memory: ${rssBefore}MB)`, {
+      category: "sync",
+      operation: "client_sync",
+      status: "started",
+      clientId: client.id || client.consultantNum,
+      executionId: currentExecutionId,
+      metadata: { clientIndex: clientIndex + 1, totalClients: clients.length, rssBeforeMb: rssBefore }
+    });
 
     try {
       // Phase 1: Data Fetch
       updatePhase(client.clientName, "fetching_data", { message: "Fetching Mary Kay data..." });
-      logger.info(`\n>>> Phase 1: Data Fetch — ${client.clientName}`);
+      logger.info(`\n>>> Phase 1: Data Fetch — ${client.clientName}`, {
+        category: "source_fetch",
+        operation: "source_fetch",
+        status: "started",
+        clientId: client.id || client.consultantNum,
+        executionId: currentExecutionId
+      });
 
       // ── Supabase: Record client start ──
       try {
@@ -110,29 +145,43 @@ async function runFullSync(clients) {
 
       // Update progress with data fetch results
       updatePhase(client.clientName, "data_fetched", {
-        consultants: stats.consultants,
-        customers: stats.customers,
-        salesVolume: stats.salesVolume,
-        starConsultants: stats.starConsultants,
+        consultants: stats.consultantListCount,
+        customers: stats.customerListCount,
+        salesVolume: stats.salesVolumeCount,
+        starConsultants: stats.starConsultantCount,
         totalContacts: contacts.length,
         message: `${contacts.length} contacts ready for GHL sync`
       });
 
       if (contacts.length === 0) {
-        logger.warn(`>>> No contacts to sync for ${client.clientName}. Skipping GHL sync.`);
-        clientEntry.status = "no_contacts";
-        failClient(client.clientName, "No contacts to sync");
+        const blocked = stats.blocked === true;
+        const reason = blocked
+          ? (stats.errors || []).join("; ") || "Required source fetch failed"
+          : "No contacts to sync";
+        logger.warn(`>>> ${blocked ? "Blocking" : "No contacts"} for ${client.clientName}: ${reason}`);
+        clientEntry.status = blocked ? "blocked" : "no_contacts";
+        clientEntry.error = reason;
+        failClient(client.clientName, reason);
 
         // ── Supabase: Complete client result ──
         try {
-          await supabase.completeClientResult(currentExecutionId, client.clientName, client.consultantNum, stats, null, "No contacts to sync");
+          await supabase.completeClientResult(currentExecutionId, client.clientName, client.consultantNum, stats, null, reason);
         } catch (_) {}
 
+        currentExecution.clients.push(clientEntry);
+        results.push(clientEntry);
+        await cleanupClientSession(client);
         continue;
       }
 
       // Phase 2: Sync to GHL
-      logger.info(`\n>>> Phase 2: GHL Sync — ${client.clientName}`);
+      logger.info(`\n>>> Phase 2: GHL Sync — ${client.clientName}`, {
+        category: "upload",
+        operation: "ghl_sync",
+        status: "started",
+        clientId: client.id || client.consultantNum,
+        executionId: currentExecutionId
+      });
       updatePhase(client.clientName, "ghl_sync", { message: "Syncing contacts to GoHighLevel..." });
 
       const ghlResult = await syncToGhl(
@@ -156,7 +205,9 @@ async function runFullSync(clients) {
       );
 
       clientEntry.ghlResult = ghlResult;
-      clientEntry.status = "completed";
+      clientEntry.status = ghlResult.errors && ghlResult.errors.length > 0
+        ? "partial_success"
+        : "completed";
 
       // Update stats
       stats.ghlSynced = ghlResult.synced;
@@ -164,7 +215,14 @@ async function runFullSync(clients) {
 
       completeClient(client.clientName, stats, ghlResult);
 
-      logger.info(`\n>>> ${client.clientName} COMPLETE:`);
+      logger.info(`\n>>> ${client.clientName} ${clientEntry.status.toUpperCase()}:`, {
+        category: "upload",
+        operation: "ghl_sync",
+        status: clientEntry.status === "partial_success" ? "partial_success" : "succeeded",
+        clientId: client.id || client.consultantNum,
+        executionId: currentExecutionId,
+        metadata: { contacts: contacts.length, synced: ghlResult.synced, errors: ghlResult.errors.length }
+      });
       logger.info(`    Contacts: ${contacts.length}`);
       logger.info(`    GHL Synced: ${ghlResult.synced}`);
       logger.info(`    GHL Errors: ${ghlResult.errors.length}`);
@@ -197,7 +255,15 @@ async function runFullSync(clients) {
       clientEntry.status = "failed";
       clientEntry.error = e.message;
       failClient(client.clientName, e.message);
-      logger.error(`>>> ${client.clientName} FAILED: ${e.message}`);
+      logger.error(`>>> ${client.clientName} FAILED: ${e.message}`, {
+        category: "sync",
+        operation: "client_sync",
+        status: "failed",
+        errorCode: e.code || "CLIENT_SYNC_FAILED",
+        clientId: client.id || client.consultantNum,
+        executionId: currentExecutionId,
+        retryable: Boolean(e.retryable)
+      });
 
       // ── Supabase: Record failure ──
       try {
@@ -208,20 +274,8 @@ async function runFullSync(clients) {
     currentExecution.clients.push(clientEntry);
     results.push(clientEntry);
 
-    // ── CRITICAL: Close browser session and free memory after each client ──
-    // This prevents cumulative memory growth across the multi-client sequence.
-    // The session cache will be rebuilt on the next client if credentials are still valid.
-    try {
-      logger.info(`[Orchestrator] Closing browser session for ${client.clientName} to free memory...`);
-      await invalidateSession(client.consultantNum);
-
-      // Force garbage collection hint (if available)
-      if (global.gc) {
-        global.gc();
-      }
-    } catch (cleanupErr) {
-      logger.warn(`[Orchestrator] Browser cleanup for ${client.clientName} had issues: ${cleanupErr.message}`);
-    }
+    // Close browser session and free memory after every completed/failed client.
+    await cleanupClientSession(client);
 
     // Log memory after cleanup
     const memAfter = process.memoryUsage();
@@ -254,18 +308,33 @@ async function runFullSync(clients) {
 
   // Summary
   const successCount = results.filter(r => r.status === "completed").length;
-  const failCount    = results.filter(r => r.status === "failed").length;
-  logger.info(`[Orchestrator] Results: ${successCount} succeeded, ${failCount} failed`);
+  const partialCount = results.filter(r => r.status === "partial_success").length;
+  const failCount    = results.filter(r => ["failed", "blocked"].includes(r.status)).length;
+  const noContactCount = results.filter(r => r.status === "no_contacts").length;
+  const summaryStatus = failCount === results.length && results.length > 0
+    ? "failed"
+    : (failCount > 0 || partialCount > 0 ? "completed_with_errors" : "completed");
+  logger.info(`[Orchestrator] Results: ${successCount} succeeded, ${partialCount} partial, ${noContactCount} no-contact, ${failCount} failed/blocked`, {
+    category: "sync",
+    operation: "full_sync",
+    status: summaryStatus,
+    executionId: currentExecutionId,
+    metadata: { successCount, partialCount, noContactCount, failCount, durationMs }
+  });
   logger.info(`═══════════════════════════════════════════════════════\n`);
 
   isRunning = false;
 
   const summary = {
-    status:    "completed",
+    status:    summaryStatus,
     startTime: execStartTime.toISOString(),
     endTime:   execEndTime.toISOString(),
     durationMs,
     durationMin,
+    successCount,
+    partialCount,
+    noContactCount,
+    failCount,
     results
   };
 

@@ -1,0 +1,38 @@
+{
+  "_schema": "mk-ghl-sync-client-config-v1",
+  "clients": [
+    {
+      "clientName": "Example Client",
+      "consultantNum": "Z00000",
+      "password": "REPLACE_IN_SECRET_STORE",
+      "ghlApiToken": "REPLACE_IN_SECRET_STORE",
+      "ghlLocationId": "REPLACE_WITH_GHL_LOCATION_ID",
+      "ghlCustomFields": {
+        "Career Level": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Activity Status": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Consultant Number": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Language Preference": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Additional Phone": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Recruiter First Name": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Recruiter Last Name": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Recruiter Consultant Number": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Start Date": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Current Wholesale": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Needed for Sapphire": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Needed for Ruby": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Needed for Diamond": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Needed for Emerald": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Needed for Pearl": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Client Last Order": "REPLACE_WITH_CUSTOM_FIELD_ID",
+        "Apt/Suite/Unit": "REPLACE_WITH_CUSTOM_FIELD_ID"
+      }
+    }
+  ],
+  "_serverConfig": {
+    "schedule": {
+      "cron": "30 0 * * *",
+      "timezone": "America/Chicago",
+      "enabled": true
+    }
+  }
+}

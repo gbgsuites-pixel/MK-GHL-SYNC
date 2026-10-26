@@ -52,8 +52,7 @@ async function fetchConsultantList(pageSession, consultantNum) {
     );
 
     if (!result) {
-      logger.warn(`[Consultant List] No result returned.`);
-      break;
+      throw new Error("Consultant List returned no result from Mary Kay.");
     }
 
     let records = result.contactList || result.records || (Array.isArray(result) ? result : null);
@@ -144,8 +143,7 @@ async function fetchSalesVolume(pageSession, consultantNum) {
   );
 
   if (!result) {
-    logger.warn(`[Sales Volume] No result returned.`);
-    return [];
+    throw new Error("Sales Volume returned no result from Mary Kay.");
   }
 
   let records = Array.isArray(result) ? result : null;
@@ -188,8 +186,7 @@ async function fetchStarConsultant(pageSession, consultantNum) {
   );
 
   if (!result) {
-    logger.warn(`[Star Consultant] No result returned.`);
-    return [];
+    throw new Error("Star Consultant returned no result from Mary Kay.");
   }
 
   let records = Array.isArray(result) ? result : null;
@@ -226,8 +223,7 @@ async function fetchCustomerList(pageSession, consultantNum) {
   );
 
   if (!result) {
-    logger.warn(`[Customer List] No result returned on first attempt.`);
-    return [];
+    throw new Error("Customer List returned no result from Mary Kay.");
   }
 
   const allRecords = Array.isArray(result) ? result
@@ -250,14 +246,21 @@ async function fetchCustomerListWithRetry(client, existingSession) {
   let pageSession = existingSession || await getSession(client.consultantNum, client.password, false);
 
   // First attempt
-  let result = await fetchCustomerList(pageSession, client.consultantNum);
+  let result = null;
+  try {
+    result = await fetchCustomerList(pageSession, client.consultantNum);
+  } catch (e) {
+    logger.warn(`[Customer List] First attempt failed: ${e.message}`);
+  }
 
-  if (result.length > 0) {
+  // An empty array is a valid successful response. Only null means the source
+  // call failed and needs the recovery path below.
+  if (result !== null) {
     return result;
   }
 
-  // First attempt failed — try navigating the page to customer-list directly
-  logger.warn(`[Customer List] First attempt returned empty. Trying direct navigation...`);
+  // First attempt failed — try navigating the page to customer-list directly.
+  logger.warn(`[Customer List] Trying direct navigation recovery...`);
   try {
     const APPS_BASE = process.env.APPS_BASE_URL || "https://apps.marykayintouch.com";
     const page = pageSession.page;
@@ -270,8 +273,11 @@ async function fetchCustomerListWithRetry(client, existingSession) {
       const newUrl = page.url();
       logger.info(`[Customer List] After navigation: ${newUrl.substring(0, 100)}`);
       if (newUrl.includes("customer-list")) {
-        result = await fetchCustomerList(pageSession, client.consultantNum);
-        if (result.length > 0) return result;
+        result = await fetchCustomerList(pageSession, client.consultantNum).catch(e => {
+          logger.warn(`[Customer List] Direct navigation fetch failed: ${e.message}`);
+          return null;
+        });
+        if (result !== null) return result;
       }
     }
   } catch (e) {
@@ -290,9 +296,12 @@ async function fetchCustomerListWithRetry(client, existingSession) {
     auraFwuid:       pageSession.auraFwuid || "",
     auraAppVersion:  pageSession.auraAppVersion || ""
   };
-  result = await fetchCustomerList(apiSession, client.consultantNum);
+  result = await fetchCustomerList(apiSession, client.consultantNum).catch(e => {
+    logger.warn(`[Customer List] Refreshed session fetch failed: ${e.message}`);
+    return null;
+  });
 
-  if (result.length > 0) {
+  if (result !== null) {
     return result;
   }
 
@@ -308,14 +317,20 @@ async function fetchCustomerListWithRetry(client, existingSession) {
     auraFwuid:       pageSession.auraFwuid || "",
     auraAppVersion:  pageSession.auraAppVersion || ""
   };
-  result = await fetchCustomerList(apiSession2, client.consultantNum);
+  result = await fetchCustomerList(apiSession2, client.consultantNum).catch(e => {
+    logger.warn(`[Customer List] Second refreshed session fetch failed: ${e.message}`);
+    return null;
+  });
 
-  if (result.length > 0) {
+  if (result !== null) {
     return result;
   }
 
-  logger.error(`[Customer List] All retry attempts exhausted. Skipping.`);
-  return [];
+  const error = new Error(
+    `[Customer List] All retry attempts exhausted for ${client.consultantNum}.`
+  );
+  logger.error(error.message);
+  throw error;
 }
 
 // =============================================================================
@@ -728,6 +743,19 @@ async function processClient(client) {
   } catch (e) {
     logger.error(`[Customer List] Error: ${e.message}`);
     stats.errors.push(`Customer List failed: ${e.message}`);
+  }
+
+  // Never merge/upload a partial source set. Empty arrays from successful
+  // responses remain valid; only explicit source/session failures reach this
+  // gate. The orchestrator records the blocked result and closes the session.
+  if (stats.errors.length > 0) {
+    stats.blocked = true;
+    stats.errorCode = "SOURCE_FETCH_FAILED";
+    logger.error(
+      `[Master Import] Blocking GHL upload for ${client.clientName}: ` +
+      `${stats.errors.join("; ")}`
+    );
+    return { contacts: [], stats };
   }
 
   // 6. Merge all data

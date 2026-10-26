@@ -6,7 +6,7 @@
 require("dotenv").config();
 
 const express = require("express");
-const { loadConfig } = require("./core/config");
+const { loadConfig, getClients, setManagedClients } = require("./core/config");
 const { startCron } = require("./scheduler/cron");
 const { closeAllSessions } = require("./sessions/sessionManager");
 const supabase = require("./core/supabase");
@@ -34,7 +34,15 @@ logger.setSupabaseModule(supabase);
 
 // Create Express app
 const app = express();
-app.use(express.json());
+app.disable("x-powered-by");
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
+app.use(express.json({ limit: "100kb" }));
 let shuttingDown = false;
 let httpServer = null;
 
@@ -161,17 +169,37 @@ app.use("/", routes);
 httpServer = app.listen(PORT, () => {
   logger.info(`[Server] Listening on port ${PORT}`);
 
-  // Start cron scheduler if configured
-  startCron();
-
-  // Initialize Supabase (non-blocking)
-  supabase.initialize().then(() => {
-    if (supabase.isEnabled()) {
-      logger.info("[Supabase] Initialized successfully.");
+  // Initialize Supabase before starting cron so managed client status is
+  // hydrated before the first scheduled execution can run.
+  (async () => {
+    try {
+      await supabase.initialize();
+      if (supabase.isEnabled()) {
+        logger.info("[Supabase] Initialized successfully.");
+        if (["1", "true", "yes", "on"].includes(String(process.env.MANAGED_CLIENTS_ENABLED || "").toLowerCase())) {
+          try {
+            const managedClients = await supabase.loadManagedClients();
+            const bootstrapClientCount = getClients().length;
+            if (managedClients.length === 0 && bootstrapClientCount > 0) {
+              logger.error(
+                `[Supabase] Managed client table is empty; retaining ${bootstrapClientCount} ` +
+                "external fallback client(s) and refusing to start managed mode with zero clients."
+              );
+            } else {
+              setManagedClients(managedClients);
+              logger.info(`[Supabase] Hydrated ${managedClients.length} managed client(s).`);
+            }
+          } catch (error) {
+            logger.error(`[Supabase] Managed client hydration failed: ${error.message}`);
+          }
+        }
+      }
+    } catch (e) {
+      logger.warn(`[Supabase] Init error: ${e.message}`);
+    } finally {
+      startCron();
     }
-  }).catch(e => {
-    logger.warn(`[Supabase] Init error: ${e.message}`);
-  });
+  })();
 
   // Start keep-alive to prevent Render idle sleep
   startKeepAlive();

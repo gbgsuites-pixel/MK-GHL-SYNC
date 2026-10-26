@@ -1,0 +1,96 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+const {
+  encryptSecrets,
+  decryptSecrets,
+  safeManagedClient,
+} = require('../src/security/clientSecrets');
+const {
+  normalizeCustomFields,
+  customFieldMap,
+} = require('../src/core/ghlAdmin');
+const { buildCustomFieldsPayload } = require('../src/sync/ghlSync');
+const config = require('../src/core/config');
+const { _withSessionLock } = require('../src/sessions/sessionManager');
+const cronScheduler = require('../src/scheduler/cron');
+
+const originalEncryptionKey = process.env.CLIENT_SECRET_ENCRYPTION_KEY;
+
+test.after(() => {
+  if (originalEncryptionKey === undefined) delete process.env.CLIENT_SECRET_ENCRYPTION_KEY;
+  else process.env.CLIENT_SECRET_ENCRYPTION_KEY = originalEncryptionKey;
+});
+
+test('managed client secrets round-trip without plaintext persistence', () => {
+  process.env.CLIENT_SECRET_ENCRYPTION_KEY = 'phase4-test-encryption-key';
+  const secrets = { password: 'fixture-password', ghlApiToken: 'fixture-token' };
+  const encrypted = encryptSecrets(secrets);
+  assert.ok(encrypted.startsWith('v1.'));
+  assert.equal(encrypted.includes(secrets.password), false);
+  assert.deepEqual(decryptSecrets(encrypted), secrets);
+  assert.equal(safeManagedClient({ client_name: 'Fixture', consultant_num: 'Z02587' }).password, undefined);
+});
+
+test('custom-field normalization returns a stable name-to-ID map', () => {
+  const fields = normalizeCustomFields({ customFields: [
+    { id: 'field-career', name: 'Career Level' },
+    { id: 'field-wholesale', name: 'Current Wholesale' },
+  ] });
+  assert.deepEqual(customFieldMap(fields), {
+    'Career Level': 'field-career',
+    'Current Wholesale': 'field-wholesale',
+  });
+});
+
+test('GHL payload keeps only mapped non-empty custom fields', () => {
+  const payload = buildCustomFieldsPayload({
+    customFields: {
+      'Career Level': 'Ruby',
+      'Current Wholesale': '',
+      'Unknown Field': 'do-not-send',
+    },
+  }, {
+    'Career Level': 'field-career',
+    'Current Wholesale': 'field-wholesale',
+  });
+  assert.deepEqual(payload, [{ id: 'field-career', field_value: 'Ruby' }]);
+});
+
+test('active-client selection excludes paused and disconnected records', () => {
+  config.setManagedClients([
+    { id: 'active', consultantNum: 'A1', status: 'active' },
+    { id: 'paused', consultantNum: 'B1', status: 'paused' },
+    { id: 'disconnected', consultantNum: 'C1', status: 'disconnected' },
+  ]);
+  assert.deepEqual(config.getActiveClients().map(client => client.id), ['active']);
+});
+
+test('same-consultant session operations are serialized', async () => {
+  const events = [];
+  const first = _withSessionLock('Z02587', async () => {
+    events.push('first:start');
+    await new Promise(resolve => setTimeout(resolve, 20));
+    events.push('first:end');
+    return 'first';
+  });
+  const second = _withSessionLock('Z02587', async () => {
+    events.push('second:start');
+    events.push('second:end');
+    return 'second';
+  });
+  assert.equal(await first, 'first');
+  assert.equal(await second, 'second');
+  assert.deepEqual(events, ['first:start', 'first:end', 'second:start', 'second:end']);
+});
+
+test('cron start is idempotent for the configured schedule', () => {
+  cronScheduler.stopCron();
+  cronScheduler.startCron();
+  const first = cronScheduler.getActiveSchedule();
+  cronScheduler.startCron();
+  const second = cronScheduler.getActiveSchedule();
+  assert.deepEqual(second, first);
+  cronScheduler.stopCron();
+  assert.equal(cronScheduler.isRunning(), false);
+});

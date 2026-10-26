@@ -5,7 +5,17 @@
 // =============================================================================
 
 const express = require("express");
-const { getClients, getClientByNum, reloadConfig, getServerConfig } = require("../core/config");
+const {
+  getClients,
+  getActiveClients,
+  getClientByNum,
+  getClientById,
+  setManagedClients,
+  reloadConfig,
+  getServerConfig,
+  getScheduleConfig,
+  persistSchedule
+} = require("../core/config");
 const { runFullSync, runSingleClientSync, getExecutionState, isRunning } = require("../scheduler/orchestrator");
 const { getCacheStatus, getSession, invalidateSession } = require("../sessions/sessionManager");
 const { fetchRawData, fetchProcessedContacts, validateAllData, exportAllLists, exportGhlReadyContacts, exportGhlReadyCsv } = require("../processors/diagnostics");
@@ -15,13 +25,37 @@ const fs = require("fs");
 const path = require("path");
 const logger = require("../utils/logger");
 const supabase = require("../core/supabase");
+const { issueStreamTicket, validateStreamTicket } = require("../security/streamTickets");
+const { fetchLocationCustomFields, customFieldMap } = require("../core/ghlAdmin");
 
 const router = express.Router();
 
-// ── CORS Headers (allow Vercel frontend to access) ──
+// ── CORS Headers ──
+const configuredOrigins = new Set(
+  String(process.env.FRONTEND_ORIGINS || "")
+    .split(",")
+    .map(origin => origin.trim())
+    .filter(Boolean)
+);
+
 router.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  const origin = req.headers.origin;
+  const secureRuntime =
+    process.env.NODE_ENV === "production" ||
+    ["1", "true", "yes", "on"].includes(
+      String(process.env.REQUIRE_EXTERNAL_CLIENT_CONFIG || "").toLowerCase()
+    );
+  const allowDevelopmentWildcard =
+    !secureRuntime && configuredOrigins.size === 0;
+
+  if (allowDevelopmentWildcard) {
+    res.header("Access-Control-Allow-Origin", "*");
+  } else if (origin && configuredOrigins.has(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+    res.header("Vary", "Origin");
+  }
+
+  res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, x-api-key");
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
@@ -31,19 +65,143 @@ router.use((req, res, next) => {
 
 // ── Authentication Middleware ──
 function requireAuth(req, res, next) {
-  const apiKey = req.headers["x-api-key"] || req.query.apiKey;
+  const allowQueryKey = ["1", "true", "yes", "on"].includes(
+    String(process.env.ALLOW_QUERY_API_KEY_AUTH || "").toLowerCase()
+  );
+  const apiKey = req.headers["x-api-key"] ||
+    (allowQueryKey ? req.query.apiKey : "");
   if (!apiKey || apiKey !== process.env.API_SECRET_KEY) {
     return res.status(401).json({ error: "Invalid or missing API key." });
   }
   next();
 }
 
+function requireStreamTicket(stream, req, res, next) {
+  const ticket = String(req.query.ticket || "");
+  if (!validateStreamTicket(ticket, stream)) {
+    return res.status(401).json({ error: "Invalid or expired stream ticket." });
+  }
+  next();
+}
+
+function managedClientsEnabled() {
+  return ["1", "true", "yes", "on"].includes(
+    String(process.env.MANAGED_CLIENTS_ENABLED || "").toLowerCase()
+  );
+}
+
+function requireManagedClients(req, res, next) {
+  if (!managedClientsEnabled()) {
+    return res.status(503).json({
+      error: "Managed client storage is disabled. Set MANAGED_CLIENTS_ENABLED=true after applying the Supabase migration.",
+      code: "MANAGED_CLIENTS_DISABLED"
+    });
+  }
+  next();
+}
+
+async function refreshManagedClientCache() {
+  const clients = await supabase.loadManagedClients();
+  setManagedClients(clients);
+  return clients;
+}
+
+function managedClientResponse(client) {
+  if (!client) return null;
+  return {
+    id: client.id,
+    clientName: client.clientName,
+    consultantNum: client.consultantNum,
+    locationId: client.locationId || client.ghlLocationId,
+    status: client.status || "active",
+    validationStatus: client.validationStatus || "unknown",
+    validationErrorCode: client.validationErrorCode || null,
+    lastValidationAt: client.lastValidationAt || null,
+    lastSyncAt: client.lastSyncAt || null,
+    lastSyncStatus: client.lastSyncStatus || null,
+    createdAt: client.createdAt || null,
+    updatedAt: client.updatedAt || null
+  };
+}
+
+function validateManagedClientInput(body) {
+  const fields = ["clientName", "consultantNum", "password", "ghlApiToken", "ghlLocationId"];
+  for (const field of fields) {
+    if (!String(body?.[field] || "").trim()) {
+      const error = new Error(`${field} is required.`);
+      error.code = "INVALID_CLIENT_INPUT";
+      throw error;
+    }
+  }
+  return {
+    clientName: String(body.clientName).trim(),
+    consultantNum: String(body.consultantNum).trim().toUpperCase(),
+    password: String(body.password),
+    ghlApiToken: String(body.ghlApiToken),
+    ghlLocationId: String(body.ghlLocationId).trim(),
+    ghlCustomFields: body.ghlCustomFields && typeof body.ghlCustomFields === "object"
+      ? body.ghlCustomFields
+      : {}
+  };
+}
+
+function parseLogFilters(query = {}) {
+  const allowedLevels = new Set(["all", "debug", "info", "warn", "error", "critical"]);
+  const allowedStatuses = new Set(["all", "started", "succeeded", "failed", "blocked", "partial_success", "skipped"]);
+  const allowedCategories = new Set(["all", "auth", "source_fetch", "validation", "sync", "upload", "schedule", "admin", "system"]);
+  const level = String(query.level || "all").toLowerCase();
+  const category = String(query.category || "all").toLowerCase();
+  const status = String(query.status || "all").toLowerCase();
+  if (!allowedLevels.has(level)) throw new Error("Invalid log level filter.");
+  if (!allowedCategories.has(category)) throw new Error("Invalid log category filter.");
+  if (!allowedStatuses.has(status)) throw new Error("Invalid log status filter.");
+
+  const limit = Number(query.limit || 200);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+    throw new Error("Log limit must be an integer between 1 and 1000.");
+  }
+
+  const safeText = (value, label) => {
+    if (!value) return null;
+    const text = String(value);
+    if (text.length > 120 || !/^[A-Za-z0-9._:@/-]+$/.test(text)) {
+      throw new Error(`Invalid ${label} filter.`);
+    }
+    return text;
+  };
+  const timestamp = (value, label) => {
+    if (!value) return null;
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) throw new Error(`Invalid ${label} timestamp.`);
+    return parsed.toISOString();
+  };
+
+  const retryable = query.retryable === undefined || query.retryable === "all"
+    ? null
+    : String(query.retryable).toLowerCase();
+  if (retryable !== null && !["true", "false"].includes(retryable)) {
+    throw new Error("retryable must be true, false, or all.");
+  }
+
+  return {
+    limit,
+    level: level === "all" ? null : level,
+    category,
+    status,
+    clientId: safeText(query.clientId, "client ID"),
+    executionId: safeText(query.executionId, "execution ID"),
+    operation: safeText(query.operation, "operation"),
+    retryable: retryable === null ? null : retryable === "true",
+    since: timestamp(query.since, "since"),
+    until: timestamp(query.until, "until")
+  };
+}
+
 // ── Health Check (no auth required) ──
 router.get("/health", (req, res) => {
   res.json({
-    status:  "ok",
-    uptime:  process.uptime(),
-    clients: getClients().length
+    status: "ok",
+    uptime: process.uptime()
   });
 });
 
@@ -52,12 +210,164 @@ router.get("/api/clients", requireAuth, (req, res) => {
   const clients = getClients();
   res.json({
     count: clients.length,
+    managed: managedClientsEnabled(),
     clients: clients.map(c => ({
+      id:            c.id || null,
       consultantNum: c.consultantNum,
       clientName:    c.clientName,
-      locationId:    c.ghlLocationId
+      locationId:    c.ghlLocationId,
+      status:        c.status || "active",
+      validationStatus: c.validationStatus || "unknown",
+      validationErrorCode: c.validationErrorCode || null,
+      lastValidationAt: c.lastValidationAt || null,
+      lastSyncAt:    c.lastSyncAt || null,
+      lastSyncStatus: c.lastSyncStatus || null,
+      updatedAt:     c.updatedAt || null
     }))
   });
+});
+
+// ── Phase 2 managed-client API ──
+router.get("/api/v1/clients", requireAuth, requireManagedClients, async (req, res) => {
+  try {
+    const clients = await supabase.listManagedClients({ includeSecrets: false });
+    res.json({ clients: clients.map(managedClientResponse), count: clients.length });
+  } catch (e) {
+    res.status(e.status === 404 ? 503 : 500).json({ error: e.message, code: e.code });
+  }
+});
+
+router.get("/api/v1/clients/:id", requireAuth, requireManagedClients, async (req, res) => {
+  try {
+    const client = await supabase.getManagedClient(req.params.id, { includeSecrets: false });
+    if (!client) return res.status(404).json({ error: "Managed client not found." });
+    res.json({ client: managedClientResponse(client) });
+  } catch (e) {
+    res.status(e.status === 404 ? 503 : 500).json({ error: e.message, code: e.code });
+  }
+});
+
+router.post("/api/v1/clients", requireAuth, requireManagedClients, async (req, res) => {
+  try {
+    const input = validateManagedClientInput(req.body);
+    const existing = getClientByNum(input.consultantNum);
+    if (existing) {
+      return res.status(409).json({
+        error: "A client with this consultant number already exists.",
+        code: "DUPLICATE_CLIENT_IDENTITY"
+      });
+    }
+    const created = await supabase.createManagedClient(input);
+    await refreshManagedClientCache();
+    res.status(201).json({ client: managedClientResponse(created), status: "pending_validation" });
+  } catch (e) {
+    const status = e.code === "DUPLICATE_CLIENT_IDENTITY" ? 409 : 400;
+    res.status(status).json({ error: e.message, code: e.code || "CLIENT_CREATE_FAILED" });
+  }
+});
+
+router.post("/api/v1/clients/:id/validate-credentials", requireAuth, requireManagedClients, async (req, res) => {
+  let managedClient = null;
+  try {
+    managedClient = await supabase.getManagedClient(req.params.id, { includeSecrets: true });
+    if (!managedClient) return res.status(404).json({ error: "Managed client not found." });
+
+    const session = await getSession(
+      managedClient.consultantNum,
+      managedClient.password,
+      true
+    );
+    const fields = await fetchLocationCustomFields(
+      managedClient.ghlApiToken,
+      managedClient.locationId
+    );
+    await invalidateSession(managedClient.consultantNum);
+
+    const updated = await supabase.updateManagedClient(req.params.id, {
+      status: "active",
+      validationStatus: "valid",
+      validationErrorCode: null,
+      lastValidationAt: new Date().toISOString(),
+      ghlCustomFields: customFieldMap(fields)
+    });
+    await refreshManagedClientCache();
+    res.json({ client: managedClientResponse(updated), customFieldCount: fields.length });
+  } catch (e) {
+    if (managedClient) {
+      try {
+        await supabase.updateManagedClient(req.params.id, {
+          status: "invalid",
+          validationStatus: "invalid",
+          validationErrorCode: e.code || "VALIDATION_FAILED",
+          lastValidationAt: new Date().toISOString()
+        });
+        await refreshManagedClientCache();
+      } catch (_) {}
+      try { await invalidateSession(managedClient.consultantNum); } catch (_) {}
+    }
+    res.status(422).json({
+      error: e.message,
+      code: e.code || "VALIDATION_FAILED",
+      action: "Verify the Mary Kay credentials, GHL token, location ID, and custom-field permissions."
+    });
+  }
+});
+
+router.patch("/api/v1/clients/:id/status", requireAuth, requireManagedClients, async (req, res) => {
+  const allowed = ["active", "paused", "disconnected", "removal_pending"];
+  const status = String(req.body?.status || "");
+  if (!allowed.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${allowed.join(", ")}.`, code: "INVALID_CLIENT_STATUS" });
+  }
+  try {
+    const client = await supabase.getManagedClient(req.params.id, { includeSecrets: true });
+    if (!client) return res.status(404).json({ error: "Managed client not found." });
+    if (["paused", "disconnected", "removal_pending"].includes(status)) {
+      await invalidateSession(client.consultantNum);
+    }
+    const updated = await supabase.updateManagedClient(req.params.id, { status });
+    await refreshManagedClientCache();
+    res.json({ client: managedClientResponse(updated) });
+  } catch (e) {
+    res.status(500).json({ error: e.message, code: e.code || "CLIENT_STATUS_UPDATE_FAILED" });
+  }
+});
+
+router.delete("/api/v1/clients/:id", requireAuth, requireManagedClients, async (req, res) => {
+  try {
+    const client = await supabase.getManagedClient(req.params.id, { includeSecrets: true });
+    if (!client) return res.status(404).json({ error: "Managed client not found." });
+    await invalidateSession(client.consultantNum);
+    const updated = await supabase.updateManagedClient(req.params.id, { status: "disconnected" });
+    await refreshManagedClientCache();
+    res.json({ status: "disconnected", client: managedClientResponse(updated) });
+  } catch (e) {
+    res.status(500).json({ error: e.message, code: e.code || "CLIENT_DISCONNECT_FAILED" });
+  }
+});
+
+router.post("/api/v1/clients/:id/sync", requireAuth, requireManagedClients, async (req, res) => {
+  if (isRunning()) return res.status(409).json({ error: "Sync already in progress." });
+  const client = getClientById(req.params.id);
+  if (!client) return res.status(404).json({ error: "Managed client not found." });
+  if (client.status !== "active") {
+    return res.status(409).json({ error: `Client is ${client.status || "inactive"}. Activate it before syncing.` });
+  }
+  runSingleClientSync(client).catch(err => logger.error(`[API] Managed client sync failed: ${err.message}`));
+  res.json({ status: "started", client: managedClientResponse(client) });
+});
+
+// ── POST /api/stream-ticket — Exchange the API key for a short-lived SSE ticket ──
+router.post("/api/stream-ticket", requireAuth, (req, res) => {
+  try {
+    const stream = req.body?.stream;
+    if (!["logs", "progress"].includes(stream)) {
+      return res.status(400).json({ error: "stream must be logs or progress." });
+    }
+    res.json(issueStreamTicket(stream));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
 // ── POST /api/sync/all — Trigger full sync for all clients ──
@@ -66,7 +376,7 @@ router.post("/api/sync/all", requireAuth, async (req, res) => {
     return res.status(409).json({ error: "Sync already in progress." });
   }
 
-  const clients = getClients();
+  const clients = getActiveClients();
   logger.info("[API] Full sync triggered via API.");
 
   const syncPromise = runFullSync(clients);
@@ -89,6 +399,12 @@ router.post("/api/sync/:consultantNum", requireAuth, async (req, res) => {
   const client = getClientByNum(req.params.consultantNum);
   if (!client) {
     return res.status(404).json({ error: "Client not found." });
+  }
+  if (client.status && client.status !== "active") {
+    return res.status(409).json({
+      error: `Client is ${client.status}. Activate it before syncing.`,
+      code: "CLIENT_NOT_ACTIVE"
+    });
   }
 
   logger.info(`[API] Single client sync triggered: ${client.clientName}`);
@@ -275,16 +591,11 @@ router.get("/api/export/ghl-csv/:consultantNum", requireAuth, async (req, res) =
 });
 
 // ── GET /api/logs — Server-Sent Events log stream ──
-router.get("/api/logs", (req, res) => {
-  // Check API key from query param for SSE
-  const apiKey = req.query.apiKey;
-  if (!apiKey || apiKey !== process.env.API_SECRET_KEY) {
-    return res.status(401).json({ error: "Invalid or missing API key." });
-  }
-
+router.get("/api/logs", (req, res, next) => requireStreamTicket("logs", req, res, next), (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
 
   const unsubscribe = logger.subscribeLogStream(res);
 
@@ -313,28 +624,20 @@ router.get("/api/schedule", requireAuth, (req, res) => {
 router.post("/api/schedule", requireAuth, async (req, res) => {
   try {
     const { cron, timezone, enabled } = req.body;
-    const configPath = path.resolve(process.env.CONFIG_PATH ||
-      path.join(__dirname, "../../config/clients.json"));
-    const raw = fs.readFileSync(configPath, "utf-8");
-    const config = JSON.parse(raw);
+    const patch = {};
+    if (cron !== undefined) patch.cron = cron;
+    if (timezone !== undefined) patch.timezone = timezone;
+    if (enabled !== undefined) patch.enabled = enabled;
+    const schedule = persistSchedule(patch);
+    logger.info(`[API] Schedule updated: ${schedule.cron} (${schedule.timezone}) [enabled: ${schedule.enabled}]`);
 
-    if (!config._serverConfig) config._serverConfig = {};
-    if (!config._serverConfig.schedule) config._serverConfig.schedule = {};
-
-    if (cron !== undefined) config._serverConfig.schedule.cron = cron;
-    if (timezone !== undefined) config._serverConfig.schedule.timezone = timezone;
-    if (enabled !== undefined) config._serverConfig.schedule.enabled = enabled;
-
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-    logger.info(`[API] Schedule updated: ${config._serverConfig.schedule.cron} (${config._serverConfig.schedule.timezone}) [enabled: ${config._serverConfig.schedule.enabled}]`);
-
-    // Reload config from disk, then restart cron with new settings
-    reloadConfig();
+    // Restart cron with the persisted schedule. Client secrets are never
+    // rewritten when configuration is supplied by the secret store.
     restartCron();
 
     res.json({
       status: "updated",
-      schedule: config._serverConfig.schedule
+      schedule
     });
   } catch (e) {
     logger.error(`[API] Schedule update failed: ${e.message}`);
@@ -343,15 +646,11 @@ router.post("/api/schedule", requireAuth, async (req, res) => {
 });
 
 // ── GET /api/progress — Server-Sent Events progress stream ──
-router.get("/api/progress", (req, res) => {
-  const apiKey = req.query.apiKey;
-  if (!apiKey || apiKey !== process.env.API_SECRET_KEY) {
-    return res.status(401).json({ error: "Invalid or missing API key." });
-  }
-
+router.get("/api/progress", (req, res, next) => requireStreamTicket("progress", req, res, next), (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
 
   const unsubscribe = subscribeProgress(res);
 
@@ -369,16 +668,7 @@ router.get("/api/progress", (req, res) => {
 // ── POST /api/cron/enable — Enable scheduled sync ──
 router.post("/api/cron/enable", requireAuth, (req, res) => {
   try {
-    const configPath = path.resolve(process.env.CONFIG_PATH ||
-      path.join(__dirname, "../../config/clients.json"));
-    const raw = fs.readFileSync(configPath, "utf-8");
-    const config = JSON.parse(raw);
-
-    if (!config._serverConfig) config._serverConfig = {};
-    if (!config._serverConfig.schedule) config._serverConfig.schedule = {};
-    config._serverConfig.schedule.enabled = true;
-
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    persistSchedule({ enabled: true });
     startCron();
 
     res.json({ status: "enabled", message: "Scheduled sync enabled." });
@@ -390,16 +680,7 @@ router.post("/api/cron/enable", requireAuth, (req, res) => {
 // ── POST /api/cron/disable — Disable scheduled sync ──
 router.post("/api/cron/disable", requireAuth, (req, res) => {
   try {
-    const configPath = path.resolve(process.env.CONFIG_PATH ||
-      path.join(__dirname, "../../config/clients.json"));
-    const raw = fs.readFileSync(configPath, "utf-8");
-    const config = JSON.parse(raw);
-
-    if (!config._serverConfig) config._serverConfig = {};
-    if (!config._serverConfig.schedule) config._serverConfig.schedule = {};
-    config._serverConfig.schedule.enabled = false;
-
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    persistSchedule({ enabled: false });
     stopCron();
 
     res.json({ status: "disabled", message: "Scheduled sync disabled." });
@@ -408,41 +689,64 @@ router.post("/api/cron/disable", requireAuth, (req, res) => {
   }
 });
 
-// ── GET /api/logs/recent — Get recent log entries as JSON ──
-router.get("/api/logs/recent", requireAuth, (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 200, 500);
-  const level = req.query.level || "all";
+function publicLogEvent(entry) {
+  return {
+    eventId: entry.event_id || entry.eventId || entry.id || null,
+    timestamp: entry.timestamp || null,
+    level: entry.level || "info",
+    category: entry.category || "system",
+    clientId: entry.client_id || entry.clientId || null,
+    executionId: entry.execution_id || entry.executionId || null,
+    operation: entry.operation || null,
+    status: entry.status || null,
+    errorCode: entry.error_code || entry.errorCode || null,
+    retryable: Boolean(entry.retryable),
+    message: entry.message || "Log event received.",
+    metadata: entry.metadata || {}
+  };
+}
 
-  // Read from log file for persistence across restarts
-  const logFile = require("path").join(__dirname, "../../logs",
-    `sync-${new Date().toISOString().split("T")[0]}.log`);
-
+// ── GET /api/v1/log-events — Durable structured operational events ──
+router.get("/api/v1/log-events", requireAuth, async (req, res) => {
   try {
-    let content = "";
-    try {
-      content = require("fs").readFileSync(logFile, "utf-8");
-    } catch (_) {
-      return res.json({ logs: [] });
+    const filters = parseLogFilters(req.query);
+    let events;
+    let source = "local_file";
+    if (supabase.isEnabled()) {
+      events = await supabase.queryRecentLogs(filters.limit, filters.level, filters.since, filters);
+      source = "supabase";
+    } else {
+      events = logger.readRecentFileEntries({
+        limit: filters.limit,
+        level: filters.level || "all",
+        category: filters.category,
+        status: filters.status
+      });
     }
-
-    const lines = content.split("\n").filter(l => l.trim());
-    const recent = lines.slice(-limit).reverse();
-
-    const parsed = recent.map(line => {
-      const match = line.match(/^\[([^\]]+)\]\s*\[(\w+)\]\s*(.*)$/);
-      if (match) {
-        return { timestamp: match[1], level: match[2].toLowerCase(), message: match[3] };
-      }
-      return { timestamp: "", level: "info", message: line };
-    });
-
-    const filtered = level === "all"
-      ? parsed
-      : parsed.filter(l => l.level === level);
-
-    res.json({ logs: filtered.reverse(), count: filtered.length });
+    res.json({ events: events.map(publicLogEvent), count: events.length, source, filters });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    const invalid = /Invalid log|must be an integer/.test(e.message);
+    res.status(invalid ? 400 : 503).json({ error: e.message, code: invalid ? "INVALID_LOG_FILTER" : "LOG_STORAGE_UNAVAILABLE" });
+  }
+});
+
+// ── GET /api/logs/recent — Legacy-compatible recent log response ──
+router.get("/api/logs/recent", requireAuth, async (req, res) => {
+  try {
+    const filters = parseLogFilters(req.query);
+    let entries = supabase.isEnabled()
+      ? await supabase.queryRecentLogs(filters.limit, filters.level, filters.since, filters)
+      : logger.readRecentFileEntries({
+        limit: filters.limit,
+        level: filters.level || "all",
+        category: filters.category,
+        status: filters.status
+      });
+    entries = entries.map(publicLogEvent);
+    res.json({ logs: entries, count: entries.length });
+  } catch (e) {
+    const invalid = /Invalid log|must be an integer/.test(e.message);
+    res.status(invalid ? 400 : 503).json({ error: e.message, code: invalid ? "INVALID_LOG_FILTER" : "LOG_STORAGE_UNAVAILABLE" });
   }
 });
 
@@ -518,12 +822,11 @@ router.get("/api/history/execution/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const [execution, clientResults, contactResults] = await Promise.all([
-      supabase.queryRecentExecutions(1),
+      supabase.queryExecution(id),
       supabase.queryClientResults(id),
       supabase.queryContactResults(id)
     ]);
-    const exec = execution.find(e => e.id === id) || null;
-    res.json({ execution: exec, clients: clientResults, contacts: contactResults });
+    res.json({ execution, clients: clientResults, contacts: contactResults });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

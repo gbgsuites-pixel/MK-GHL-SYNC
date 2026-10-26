@@ -27,6 +27,16 @@ const LOGIN_RETRY_DELAY_MS = 5000;
 
 // In-memory session cache
 const sessionCache = {};
+const sessionLocks = new Map();
+
+function withSessionLock(key, task) {
+  const previous = sessionLocks.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(task);
+  sessionLocks.set(key, current);
+  return current.finally(() => {
+    if (sessionLocks.get(key) === current) sessionLocks.delete(key);
+  });
+}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -478,7 +488,7 @@ async function loginAndGetSession(consultantNum, password) {
 // PUBLIC API
 // =============================================================================
 
-async function getSession(consultantNum, password, forceRefresh = false) {
+async function getSessionUnlocked(consultantNum, password, forceRefresh = false) {
   const key = consultantNum.toUpperCase();
 
   if (!forceRefresh && isCacheValid(key)) {
@@ -521,7 +531,12 @@ async function getSession(consultantNum, password, forceRefresh = false) {
   throw new Error(`Login failed for ${key} after ${LOGIN_MAX_RETRIES} attempts.`);
 }
 
-async function invalidateSession(consultantNum) {
+async function getSession(consultantNum, password, forceRefresh = false) {
+  const key = String(consultantNum).toUpperCase();
+  return withSessionLock(key, () => getSessionUnlocked(key, password, forceRefresh));
+}
+
+async function invalidateSessionUnlocked(consultantNum) {
   const key = consultantNum.toUpperCase();
   logger.info(`[Session] Invalidating session for ${key}`);
 
@@ -541,8 +556,14 @@ async function invalidateSession(consultantNum) {
   }
 }
 
+async function invalidateSession(consultantNum) {
+  const key = String(consultantNum).toUpperCase();
+  return withSessionLock(key, () => invalidateSessionUnlocked(key));
+}
+
 async function closeAllSessions() {
   logger.info(`[Session] Closing all sessions...`);
+  await Promise.allSettled([...sessionLocks.values()]);
   for (const key of Object.keys(sessionCache)) {
     const entry = sessionCache[key];
     if (entry && entry.browser) {
@@ -581,5 +602,6 @@ module.exports = {
   getSession,
   invalidateSession,
   closeAllSessions,
-  getCacheStatus
+  getCacheStatus,
+  _withSessionLock: withSessionLock
 };

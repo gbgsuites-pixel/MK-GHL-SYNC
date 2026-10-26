@@ -16,6 +16,12 @@
 
 const axios = require("axios");
 const logger = require("../utils/logger");
+const {
+  encryptSecrets,
+  decryptSecrets,
+  safeManagedClient,
+  ENCRYPTION_VERSION
+} = require("../security/clientSecrets");
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_KEY = process.env.SUPABASE_KEY || "";
@@ -26,8 +32,10 @@ let isInitialized = false;
 // In-memory queue for log writes (batched to reduce API calls)
 const logWriteQueue = [];
 let flushInterval = null;
+let flushPromise = null;
 const FLUSH_INTERVAL_MS = 5000;
 const MAX_QUEUE_SIZE = 200;
+const MAX_RETRY_QUEUE_SIZE = 5000;
 
 // ── HTTP Client ──
 function supabaseClient() {
@@ -85,31 +93,75 @@ function isEnabled() {
 // ── Batched Log Flush ──
 function startLogFlush() {
   if (flushInterval) return;
-  flushInterval = setInterval(async () => {
-    if (logWriteQueue.length === 0) return;
-    const batch = logWriteQueue.splice(0, MAX_QUEUE_SIZE);
-    await batchInsertLogs(batch);
-  }, FLUSH_INTERVAL_MS);
+  flushInterval = setInterval(() => { void flushLogQueue(); }, FLUSH_INTERVAL_MS);
   if (flushInterval.unref) flushInterval.unref();
 }
 
+async function flushLogQueue({ drain = false, deadlineMs = 5000 } = {}) {
+  if (flushPromise) return flushPromise;
+  flushPromise = (async () => {
+    const startedAt = Date.now();
+    do {
+      if (logWriteQueue.length === 0) break;
+      const batch = logWriteQueue.splice(0, MAX_QUEUE_SIZE);
+      const succeeded = await batchInsertLogs(batch);
+      if (!succeeded) break;
+      if (!drain) break;
+    } while (Date.now() - startedAt < deadlineMs);
+  })().finally(() => {
+    flushPromise = null;
+  });
+  return flushPromise;
+}
+
 async function batchInsertLogs(entries) {
-  if (!isInitialized || entries.length === 0) return;
+  if (!isInitialized || entries.length === 0) return false;
   const client = supabaseClient();
 
   const rows = entries.map(e => ({
+    event_id: e.eventId || e.id || null,
     timestamp: e.timestamp,
     level: e.level,
-    message: e.message
+    message: e.message,
+    category: e.category || "system",
+    client_id: e.clientId || null,
+    execution_id: e.executionId || null,
+    operation: e.operation || null,
+    status: e.status || null,
+    error_code: e.errorCode || null,
+    retryable: Boolean(e.retryable),
+    metadata: e.metadata || {}
   }));
 
   try {
     const res = await client.post("/rest/v1/server_logs", rows);
     if (res.status >= 300) {
-      console.warn(`[Supabase] Log batch insert failed: HTTP ${res.status}`);
+      // Allow a rolling deployment to keep persisting the legacy columns until
+      // the additive structured-log migration has been applied.
+      if (res.status < 500) {
+        const legacyRows = entries.map(e => ({
+          timestamp: e.timestamp,
+          level: e.level,
+          message: e.message
+        }));
+        const legacy = await client.post("/rest/v1/server_logs", legacyRows);
+        if (legacy.status < 300) return true;
+      }
+      console.warn(`[Supabase] Log batch insert failed: HTTP ${res.status}; retaining ${entries.length} event(s).`);
+      logWriteQueue.unshift(...entries.slice(0, MAX_RETRY_QUEUE_SIZE));
+      if (logWriteQueue.length > MAX_RETRY_QUEUE_SIZE) {
+        logWriteQueue.splice(MAX_RETRY_QUEUE_SIZE);
+      }
+      return false;
     }
+    return true;
   } catch (e) {
-    console.warn(`[Supabase] Log batch insert error: ${e.message}`);
+    logWriteQueue.unshift(...entries);
+    if (logWriteQueue.length > MAX_RETRY_QUEUE_SIZE) {
+      logWriteQueue.splice(MAX_RETRY_QUEUE_SIZE);
+    }
+    console.warn(`[Supabase] Log batch insert error: ${e.message}; retaining ${entries.length} event(s).`);
+    return false;
   }
 }
 
@@ -121,9 +173,7 @@ function queueLogEntry(entry) {
   if (!isInitialized) return;
   logWriteQueue.push(entry);
   if (logWriteQueue.length >= MAX_QUEUE_SIZE) {
-    // Flush immediately if queue is full
-    const batch = logWriteQueue.splice(0, MAX_QUEUE_SIZE);
-    batchInsertLogs(batch);
+    void flushLogQueue();
   }
 }
 
@@ -305,23 +355,57 @@ async function shutdown() {
     clearInterval(flushInterval);
     flushInterval = null;
   }
-  if (logWriteQueue.length > 0) {
-    const batch = logWriteQueue.splice(0, MAX_QUEUE_SIZE);
-    await batchInsertLogs(batch);
+  const deadline = Date.now() + 5000;
+  while (logWriteQueue.length > 0 && Date.now() < deadline) {
+    await flushLogQueue({ drain: true, deadlineMs: Math.max(1, deadline - Date.now()) });
+    if (logWriteQueue.length > 0) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
   }
 }
 
 // ── Query Helpers (used by API routes) ──
-async function queryRecentLogs(limit = 200, level = null, since = null) {
+async function queryRecentLogs(limit = 200, level = null, since = null, filters = {}) {
   if (!isInitialized) return [];
   const client = supabaseClient();
 
-  let query = `/rest/v1/server_logs?select=*&order=timestamp.desc&limit=${limit}`;
-  if (level) query += `&level=eq.${level}`;
-  if (since) query += `&timestamp=gte.${since}`;
+  const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 200, 1), 1000);
+  const structuredSelect = "event_id,timestamp,level,message,category,client_id,execution_id,operation,status,error_code,retryable,metadata";
+  let query = `/rest/v1/server_logs?select=${structuredSelect}&order=timestamp.desc&limit=${safeLimit}`;
+  const equals = {
+    level,
+    category: filters.category,
+    client_id: filters.clientId,
+    execution_id: filters.executionId,
+    operation: filters.operation,
+    status: filters.status,
+    retryable: filters.retryable
+  };
+  Object.entries(equals).forEach(([field, value]) => {
+    if (value !== null && value !== undefined && value !== "" && value !== "all") {
+      query += `&${field}=eq.${encodeURIComponent(value)}`;
+    }
+  });
+  if (since) query += `&timestamp=gte.${encodeURIComponent(since)}`;
+  if (filters.until) query += `&timestamp=lte.${encodeURIComponent(filters.until)}`;
 
   const res = await client.get(query);
-  if (res.status < 300 && res.data) return res.data;
+  if (res.status < 300 && Array.isArray(res.data)) return res.data;
+
+  // The additive migration may not be applied during a rolling deployment.
+  // Fall back to legacy columns rather than taking down the logs view.
+  let legacyQuery = `/rest/v1/server_logs?select=*&order=timestamp.desc&limit=${safeLimit}`;
+  if (level && level !== "all") legacyQuery += `&level=eq.${encodeURIComponent(level)}`;
+  if (since) legacyQuery += `&timestamp=gte.${encodeURIComponent(since)}`;
+  const legacy = await client.get(legacyQuery);
+  if (legacy.status < 300 && Array.isArray(legacy.data)) {
+    return legacy.data.map(entry => ({
+      ...entry,
+      event_id: entry.event_id || null,
+      category: entry.category || "system",
+      retryable: Boolean(entry.retryable)
+    }));
+  }
   return [];
 }
 
@@ -332,6 +416,15 @@ async function queryRecentExecutions(limit = 50) {
   const res = await client.get(`/rest/v1/sync_executions?select=*&order=started_at.desc&limit=${limit}`);
   if (res.status < 300 && res.data) return res.data;
   return [];
+}
+
+async function queryExecution(executionId) {
+  if (!isInitialized || !executionId) return null;
+  const client = supabaseClient();
+  const encodedId = encodeURIComponent(String(executionId));
+  const res = await client.get(`/rest/v1/sync_executions?select=*&id=eq.${encodedId}&limit=1`);
+  if (res.status < 300 && Array.isArray(res.data) && res.data.length > 0) return res.data[0];
+  return null;
 }
 
 async function queryClientResults(executionId) {
@@ -374,6 +467,164 @@ async function queryServerEvents(limit = 100) {
   return [];
 }
 
+// ── Managed integration clients ──
+const MANAGED_CLIENT_SELECT = [
+  "id",
+  "client_name",
+  "consultant_num",
+  "ghl_location_id",
+  "ghl_custom_fields",
+  "encrypted_credentials",
+  "secret_key_version",
+  "status",
+  "validation_status",
+  "validation_error_code",
+  "last_validation_at",
+  "last_sync_at",
+  "last_sync_status",
+  "created_at",
+  "updated_at"
+].join(",");
+
+function managedTableError(response) {
+  const error = new Error(
+    "Managed client storage is unavailable. Apply migrations/VA-3379 - integration_clients.sql in Supabase."
+  );
+  error.code = "MANAGED_CLIENTS_TABLE_MISSING";
+  error.status = response?.status;
+  return error;
+}
+
+function ensureSupabaseForManagedClients() {
+  if (!isInitialized) {
+    const error = new Error("Supabase is not initialized.");
+    error.code = "SUPABASE_NOT_INITIALIZED";
+    throw error;
+  }
+}
+
+function rowToManagedClient(row, includeSecrets) {
+  const metadata = safeManagedClient(row);
+  const result = {
+    ...metadata,
+    ghlCustomFields: row.ghl_custom_fields || {}
+  };
+
+  if (includeSecrets) {
+    const secrets = decryptSecrets(row.encrypted_credentials);
+    return {
+      ...result,
+      password: secrets.password,
+      ghlApiToken: secrets.ghlApiToken
+    };
+  }
+
+  return result;
+}
+
+async function fetchManagedClientRows(query = "") {
+  ensureSupabaseForManagedClients();
+  const client = supabaseClient();
+  const response = await client.get(
+    `/rest/v1/integration_clients?select=${MANAGED_CLIENT_SELECT}${query}`
+  );
+  if (response.status === 404 || response.status === 42) {
+    throw managedTableError(response);
+  }
+  if (response.status >= 300) {
+    throw new Error(`Managed client query failed with HTTP ${response.status}.`);
+  }
+  return Array.isArray(response.data) ? response.data : [];
+}
+
+async function listManagedClients({ includeSecrets = false } = {}) {
+  const rows = await fetchManagedClientRows("&order=created_at.asc");
+  return rows.map(row => rowToManagedClient(row, includeSecrets));
+}
+
+async function getManagedClient(id, { includeSecrets = false } = {}) {
+  const rows = await fetchManagedClientRows(`&id=eq.${encodeURIComponent(id)}&limit=1`);
+  return rows.length ? rowToManagedClient(rows[0], includeSecrets) : null;
+}
+
+async function createManagedClient(input) {
+  ensureSupabaseForManagedClients();
+  const client = supabaseClient();
+  const row = {
+    client_name: input.clientName,
+    consultant_num: input.consultantNum,
+    ghl_location_id: input.ghlLocationId,
+    ghl_custom_fields: input.ghlCustomFields || {},
+    encrypted_credentials: encryptSecrets({
+      password: input.password,
+      ghlApiToken: input.ghlApiToken
+    }),
+    secret_key_version: ENCRYPTION_VERSION,
+    status: input.status || "pending_validation",
+    validation_status: input.validationStatus || "pending",
+    validation_error_code: input.validationErrorCode || null
+  };
+  const response = await client.post("/rest/v1/integration_clients", row, {
+    headers: { Prefer: "return=representation" }
+  });
+  if (response.status === 409) {
+    const error = new Error("A managed client with this consultant number already exists.");
+    error.code = "DUPLICATE_CLIENT_IDENTITY";
+    throw error;
+  }
+  if (response.status >= 300) {
+    throw new Error(`Managed client creation failed with HTTP ${response.status}.`);
+  }
+  const created = Array.isArray(response.data) ? response.data[0] : response.data;
+  return rowToManagedClient(created || { ...row, id: null }, false);
+}
+
+async function updateManagedClient(id, patch = {}) {
+  ensureSupabaseForManagedClients();
+  const client = supabaseClient();
+  const updates = {};
+  if (patch.clientName !== undefined) updates.client_name = patch.clientName;
+  if (patch.consultantNum !== undefined) updates.consultant_num = patch.consultantNum;
+  if (patch.ghlLocationId !== undefined) updates.ghl_location_id = patch.ghlLocationId;
+  if (patch.ghlCustomFields !== undefined) updates.ghl_custom_fields = patch.ghlCustomFields;
+  if (patch.status !== undefined) updates.status = patch.status;
+  if (patch.validationStatus !== undefined) updates.validation_status = patch.validationStatus;
+  if (patch.validationErrorCode !== undefined) updates.validation_error_code = patch.validationErrorCode;
+  if (patch.lastValidationAt !== undefined) updates.last_validation_at = patch.lastValidationAt;
+  if (patch.lastSyncAt !== undefined) updates.last_sync_at = patch.lastSyncAt;
+  if (patch.lastSyncStatus !== undefined) updates.last_sync_status = patch.lastSyncStatus;
+  if (patch.password !== undefined || patch.ghlApiToken !== undefined) {
+    const current = await getManagedClient(id, { includeSecrets: true });
+    if (!current) return null;
+    updates.encrypted_credentials = encryptSecrets({
+      password: patch.password !== undefined ? patch.password : current.password,
+      ghlApiToken: patch.ghlApiToken !== undefined ? patch.ghlApiToken : current.ghlApiToken
+    });
+    updates.secret_key_version = ENCRYPTION_VERSION;
+  }
+
+  if (Object.keys(updates).length === 0) return getManagedClient(id, { includeSecrets: false });
+  const response = await client.patch(
+    `/rest/v1/integration_clients?id=eq.${encodeURIComponent(id)}`,
+    updates,
+    { headers: { Prefer: "return=representation" } }
+  );
+  if (response.status === 409) {
+    const error = new Error("A managed client with this consultant number already exists.");
+    error.code = "DUPLICATE_CLIENT_IDENTITY";
+    throw error;
+  }
+  if (response.status >= 300) {
+    throw new Error(`Managed client update failed with HTTP ${response.status}.`);
+  }
+  const updated = Array.isArray(response.data) ? response.data[0] : response.data;
+  return updated ? rowToManagedClient(updated, false) : getManagedClient(id, { includeSecrets: false });
+}
+
+async function loadManagedClients() {
+  return listManagedClients({ includeSecrets: true });
+}
+
 // ── Public API ──
 module.exports = {
   initialize,
@@ -392,8 +643,14 @@ module.exports = {
   // Queries (for API routes)
   queryRecentLogs,
   queryRecentExecutions,
+  queryExecution,
   queryClientResults,
   queryContactResults,
   queryMemoryHistory,
-  queryServerEvents
+  queryServerEvents,
+  listManagedClients,
+  getManagedClient,
+  createManagedClient,
+  updateManagedClient,
+  loadManagedClients
 };

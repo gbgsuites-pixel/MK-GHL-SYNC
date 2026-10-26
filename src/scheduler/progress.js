@@ -92,7 +92,7 @@ function updateGhlProgress(clientName, cursor, total, synced, skipped, errors) {
 function completeClient(clientName, stats, ghlResult) {
   const clientEntry = progressState?.clients.find(c => c.name === clientName);
   if (clientEntry) {
-    clientEntry.phase = "completed";
+    clientEntry.phase = ghlResult?.errors?.length > 0 ? "partial_success" : "completed";
     clientEntry.progress = {
       ...clientEntry.progress,
       stats,
@@ -133,7 +133,7 @@ function startExecution(totalClients) {
  */
 function completeExecution(summary) {
   if (progressState) {
-    progressState.status = "completed";
+    progressState.status = summary?.status || "completed";
     progressState.endTime = new Date().toISOString();
     progressState.summary = summary;
     broadcastProgress(progressState);

@@ -1,6 +1,6 @@
 FROM node:22-slim
 
-# Install Chromium dependencies for Puppeteer
+# Install Chromium dependencies for Puppeteer.
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-liberation \
@@ -23,16 +23,24 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Use the system Chromium installed above instead of downloading a second
-# browser during npm install.
+# browser during npm install. Production must receive client secrets from a
+# runtime secret source, never from the repository build context.
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+ENV REQUIRE_EXTERNAL_CLIENT_CONFIG=true
+ENV NODE_ENV=production
+ENV RUNTIME_DATA_DIR=/app/runtime
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
 
 COPY . .
+RUN mkdir -p /app/runtime /app/logs \
+    && chown -R node:node /app
+
+USER node
 
 EXPOSE 3000
 
