@@ -24,8 +24,19 @@ const {
 const { fetchLocationCustomFields, customFieldMap } = require("../core/ghlAdmin");
 const {
   compareProtectedFieldMapping,
+  hasCompleteProtectedFieldMapping,
   inspectProtectedFieldSource
 } = require("../core/protectedFields");
+
+function strictGhlFieldPreflightEnabled() {
+  return ["1", "true", "yes", "on"].includes(
+    String(process.env.STRICT_GHL_FIELD_PREFLIGHT || "").toLowerCase()
+  );
+}
+
+function storedMappingFallbackWarning(client, reason) {
+  return `Live GHL custom-field verification was unavailable for ${client.clientName}; using the complete stored mapping. ${reason}`;
+}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -704,6 +715,25 @@ async function processClient(client) {
     );
     stats.protectedFieldMapping = mappingCheck;
     if (!mappingCheck.ok) {
+      const storedMappingComplete = hasCompleteProtectedFieldMapping(client.ghlCustomFields);
+      const liveMappingUnavailable = mappingCheck.missingFromLive.length > 0 && mappingCheck.changedIds.length === 0;
+      if (storedMappingComplete && liveMappingUnavailable && !strictGhlFieldPreflightEnabled()) {
+        stats.protectedFieldMapping = {
+          ...mappingCheck,
+          ok: true,
+          mode: "stored_mapping_unverified"
+        };
+        stats.protectedFieldWarnings = [
+          storedMappingFallbackWarning(
+            client,
+            "Set STRICT_GHL_FIELD_PREFLIGHT=true to block instead of using stored IDs."
+          )
+        ];
+        logger.warn(
+          `[Protected Fields] ${stats.protectedFieldWarnings[0]}`,
+          { category: "validation", operation: "protected_field_mapping", status: "warning", clientId: client.id || client.consultantNum }
+        );
+      } else {
       stats.blocked = true;
       stats.errorCode = "PROTECTED_FIELD_MAPPING_FAILED";
       stats.protectedFieldAlerts = mappingCheck.alerts;
@@ -713,8 +743,26 @@ async function processClient(client) {
         { category: "validation", operation: "protected_field_mapping", status: "blocked", clientId: client.id || client.consultantNum }
       );
       return { contacts: [], stats };
+      }
     }
   } catch (e) {
+    if (hasCompleteProtectedFieldMapping(client.ghlCustomFields) && !strictGhlFieldPreflightEnabled()) {
+      stats.protectedFieldMapping = {
+        ok: true,
+        mode: "stored_mapping_unverified",
+        errorCode: e.code || "GHL_CUSTOM_FIELDS_UNAVAILABLE"
+      };
+      stats.protectedFieldWarnings = [
+        storedMappingFallbackWarning(
+          client,
+          `The live check returned ${e.code || "an unknown error"}. Set STRICT_GHL_FIELD_PREFLIGHT=true to block instead.`
+        )
+      ];
+      logger.warn(
+        `[Protected Fields] ${stats.protectedFieldWarnings[0]}`,
+        { category: "validation", operation: "protected_field_mapping", status: "warning", clientId: client.id || client.consultantNum, errorCode: e.code || "GHL_CUSTOM_FIELDS_UNAVAILABLE" }
+      );
+    } else {
     stats.blocked = true;
     stats.errorCode = e.code || "PROTECTED_FIELD_MAPPING_FAILED";
     stats.protectedFieldAlerts = [e.message];
@@ -724,6 +772,7 @@ async function processClient(client) {
       { category: "validation", operation: "protected_field_mapping", status: "blocked", clientId: client.id || client.consultantNum, errorCode: stats.errorCode }
     );
     return { contacts: [], stats };
+    }
   }
 
   // 1. Get live session (Puppeteer page)

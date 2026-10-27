@@ -78,6 +78,17 @@ function mask(value, visible = 3) {
   return `${text.slice(0, visible)}${"•".repeat(Math.min(8, text.length - visible))}`;
 }
 
+function parseJsonObject(value, fallback = {}) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch (_) {}
+  }
+  return fallback;
+}
+
 function safeManagedClient(record) {
   return {
     id: record.id,
@@ -91,7 +102,7 @@ function safeManagedClient(record) {
     lastValidationAt: record.last_validation_at || null,
     lastSyncAt: record.last_sync_at || null,
     lastSyncStatus: record.last_sync_status || null,
-    lastSyncStats: record.last_sync_stats || record.lastSyncStats || {},
+    lastSyncStats: parseJsonObject(record.last_sync_stats || record.lastSyncStats),
     createdAt: record.created_at || null,
     updatedAt: record.updated_at || null
   };
@@ -101,6 +112,7 @@ module.exports = {
   encryptSecrets,
   decryptSecrets,
   mask,
+  parseJsonObject,
   safeManagedClient,
   ENCRYPTION_VERSION: VERSION
 };

@@ -15,6 +15,7 @@ const {
 const {
   PROTECTED_CUSTOM_FIELDS,
   compareProtectedFieldMapping,
+  hasCompleteProtectedFieldMapping,
   inspectProtectedFieldSource,
 } = require('../src/core/protectedFields');
 const { buildCustomFieldsPayload } = require('../src/sync/ghlSync');
@@ -62,6 +63,7 @@ test('managed client routes support GHL onboarding and permanent removal', () =>
 
 test('protected fields block mapping drift and detect an interrupted source field', () => {
   const stored = Object.fromEntries(PROTECTED_CUSTOM_FIELDS.map((name) => [name, `stored-${name}`]));
+  assert.equal(hasCompleteProtectedFieldMapping(stored), true);
   const live = { ...stored, 'Activity Status': 'live-activity-status' };
   const mapping = compareProtectedFieldMapping(stored, live);
   assert.equal(mapping.ok, false);
@@ -73,6 +75,13 @@ test('protected fields block mapping drift and detect an interrupted source fiel
   });
   assert.equal(source.ok, false);
   assert.match(source.alerts[0], /Current Wholesale/);
+});
+
+test('managed client hydration accepts serialized JSONB values', () => {
+  const { parseJsonObject } = require('../src/security/clientSecrets');
+  assert.deepEqual(parseJsonObject('{"Activity Status":"field-activity"}'), {
+    'Activity Status': 'field-activity',
+  });
 });
 
 test('GHL payload keeps only mapped non-empty custom fields', () => {

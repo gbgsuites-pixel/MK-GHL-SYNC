@@ -20,6 +20,7 @@ const {
   encryptSecrets,
   decryptSecrets,
   safeManagedClient,
+  parseJsonObject,
   ENCRYPTION_VERSION
 } = require("../security/clientSecrets");
 
@@ -514,7 +515,7 @@ function rowToManagedClient(row, includeSecrets) {
   const metadata = safeManagedClient(row);
   const result = {
     ...metadata,
-    ghlCustomFields: row.ghl_custom_fields || {}
+    ghlCustomFields: parseJsonObject(row.ghl_custom_fields)
   };
 
   if (includeSecrets) {

@@ -26,6 +26,11 @@ function fieldIdMap(value) {
   }, {});
 }
 
+function hasCompleteProtectedFieldMapping(value) {
+  const ids = fieldIdMap(value);
+  return PROTECTED_CUSTOM_FIELDS.every((fieldName) => Boolean(ids[normalizeFieldName(fieldName)]));
+}
+
 function compareProtectedFieldMapping(storedMap, liveMap) {
   const stored = normalizeFieldMap(storedMap);
   const live = normalizeFieldMap(liveMap);
@@ -109,5 +114,6 @@ function inspectProtectedFieldSource(contacts, previousSyncStats = {}) {
 module.exports = {
   PROTECTED_CUSTOM_FIELDS,
   compareProtectedFieldMapping,
+  hasCompleteProtectedFieldMapping,
   inspectProtectedFieldSource
 };

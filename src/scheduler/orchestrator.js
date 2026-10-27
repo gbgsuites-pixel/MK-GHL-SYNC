@@ -66,6 +66,7 @@ async function persistManagedClientSyncResult(client, status, details = {}) {
         customers: Number(stats.customerListCount) || 0,
         message: details.message || null,
         protectedFieldAlerts: details.protectedFieldAlerts || stats.protectedFieldAlerts || [],
+        protectedFieldWarnings: details.protectedFieldWarnings || stats.protectedFieldWarnings || [],
         protectedFields: details.protectedFieldStats || stats.protectedFieldStats || {}
       }
     });
@@ -192,6 +193,7 @@ async function runFullSync(clients) {
           message: reason,
           stats,
           protectedFieldAlerts: stats.protectedFieldAlerts,
+          protectedFieldWarnings: stats.protectedFieldWarnings,
           protectedFieldStats: stats.protectedFieldStats
         });
 
@@ -250,6 +252,7 @@ async function runFullSync(clients) {
         skipped: ghlResult.skipped || stats.skipped || 0,
         stats,
         protectedFieldAlerts: stats.protectedFieldAlerts,
+        protectedFieldWarnings: stats.protectedFieldWarnings,
         protectedFieldStats: stats.protectedFieldStats
       });
 
@@ -299,6 +302,7 @@ async function runFullSync(clients) {
         message: e.message,
         stats: clientEntry.stats || {},
         protectedFieldAlerts: clientEntry.stats?.protectedFieldAlerts,
+        protectedFieldWarnings: clientEntry.stats?.protectedFieldWarnings,
         protectedFieldStats: clientEntry.stats?.protectedFieldStats
       });
       logger.error(`>>> ${client.clientName} FAILED: ${e.message}`, {
