@@ -101,7 +101,7 @@ function resolveConfigSource() {
       return {
         type: "managed",
         label: "Supabase integration_clients",
-        value: loadManagedBootstrapFallback(),
+        value: { clients: [], _serverConfig: {} },
         path: null
       };
     }
@@ -117,24 +117,6 @@ function resolveConfigSource() {
     value: readJsonFile(DEFAULT_CONFIG_PATH),
     path: DEFAULT_CONFIG_PATH
   };
-}
-
-function loadManagedBootstrapFallback() {
-  const fallbackPath = String(process.env.MANAGED_CLIENTS_FALLBACK_CONFIG_PATH || "").trim();
-  if (!fallbackPath) return { clients: [], _serverConfig: {} };
-
-  const absolutePath = path.resolve(fallbackPath);
-  if (isBundledClientConfig(absolutePath)) {
-    throw new Error(
-      "SECURITY: MANAGED_CLIENTS_FALLBACK_CONFIG_PATH must point to an external backup, not the tracked repository client config."
-    );
-  }
-
-  const fallback = readJsonFile(absolutePath);
-  if (!fallback || !Array.isArray(fallback.clients)) {
-    throw new Error("MANAGED_CLIENTS_FALLBACK_CONFIG_PATH must contain a clients array.");
-  }
-  return fallback;
 }
 
 function findDuplicateValues(clients, field) {

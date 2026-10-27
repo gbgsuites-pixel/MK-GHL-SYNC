@@ -11,6 +11,7 @@ const {
   getClientByNum,
   getClientById,
   setManagedClients,
+  isManagedClientsLoaded,
   reloadConfig,
   getServerConfig,
   getScheduleConfig,
@@ -211,6 +212,12 @@ router.get("/health", (req, res) => {
 
 // ── GET /api/clients — List all configured clients ──
 router.get("/api/clients", requireAuth, (req, res) => {
+  if (managedClientsEnabled() && !isManagedClientsLoaded()) {
+    return res.status(503).json({
+      error: "Supabase managed clients are not loaded. Check backend startup logs and Supabase configuration.",
+      code: "MANAGED_CLIENT_CACHE_NOT_READY"
+    });
+  }
   const clients = getClients();
   res.json({
       count: clients.length,

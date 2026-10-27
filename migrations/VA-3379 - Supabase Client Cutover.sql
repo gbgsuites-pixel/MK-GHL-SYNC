@@ -20,6 +20,7 @@ create table if not exists public.integration_clients (
   last_validation_at timestamptz,
   last_sync_at timestamptz,
   last_sync_status text,
+  last_sync_stats jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (consultant_num)
@@ -29,6 +30,9 @@ create index if not exists integration_clients_status_idx
   on public.integration_clients (status);
 create index if not exists integration_clients_updated_at_idx
   on public.integration_clients (updated_at desc);
+
+alter table public.integration_clients
+  add column if not exists last_sync_stats jsonb not null default '{}'::jsonb;
 
 create or replace function public.set_integration_clients_updated_at()
 returns trigger

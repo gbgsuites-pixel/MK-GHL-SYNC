@@ -63,11 +63,17 @@ async function initialize() {
 
   try {
     const client = supabaseClient();
-    const res = await client.get("/rest/v1/server_logs?select=id&limit=1");
+    const managedMode = ["1", "true", "yes", "on"].includes(
+      String(process.env.MANAGED_CLIENTS_ENABLED || "").toLowerCase()
+    );
+    // Managed mode must be able to read the client store before the server can
+    // hydrate the runtime. Logging/history tables are optional for this gate.
+    const requiredTable = managedMode ? "integration_clients" : "server_logs";
+    const res = await client.get(`/rest/v1/${requiredTable}?select=id&limit=1`);
 
     if (res.status < 400) {
       isInitialized = true;
-      console.log("[Supabase] Connected successfully.");
+      console.log(`[Supabase] Connected successfully through ${requiredTable}.`);
 
       // Start background log flush
       startLogFlush();
@@ -637,7 +643,27 @@ async function deleteManagedClient(id) {
 }
 
 async function loadManagedClients() {
-  return listManagedClients({ includeSecrets: true });
+  const rows = await fetchManagedClientRows("&order=created_at.asc");
+  return rows.map(row => {
+    try {
+      return rowToManagedClient(row, true);
+    } catch (error) {
+      // Keep valid rows visible when one imported row was encrypted with a
+      // different key or an unsupported envelope. Mark only that client
+      // invalid so it cannot sync until its credentials are replaced.
+      logger.error(
+        `[Supabase] Credential decryption failed for ${row.consultant_num || row.id}; ` +
+        "client marked invalid."
+      );
+      const safe = rowToManagedClient(row, false);
+      return {
+        ...safe,
+        status: "invalid",
+        validationStatus: "invalid",
+        validationErrorCode: "CREDENTIAL_DECRYPTION_FAILED"
+      };
+    }
+  });
 }
 
 // ── Public API ──

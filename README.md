@@ -109,7 +109,6 @@ npm start
 | `FRONTEND_ORIGINS` | Comma-separated exact dashboard origins allowed by CORS | runtime setting |
 | `SCHEDULE_CONFIG_PATH` | Writable schedule state path when clients are loaded from secret JSON | `./runtime/schedule.json` |
 | `MANAGED_CLIENTS_ENABLED` | Enable encrypted Supabase-backed client management after migration | `false` |
-| `MANAGED_CLIENTS_FALLBACK_CONFIG_PATH` | Optional external backup used if Supabase hydration fails during cutover; never use the tracked config file | `/secure/backups/clients.json` |
 | `CLIENT_SECRET_ENCRYPTION_KEY` | Runtime-only key used to encrypt Mary Kay/GHL credentials at rest | secret |
 | `LOG_LEVEL` | Logging verbosity | `info` |
 | `GHL_CHUNK_SIZE` | Contacts per GHL API batch | `50` |
@@ -121,9 +120,9 @@ npm start
 ### Adding Clients
 
 For local development only, copy `config/clients.example.json` to the ignored
-`config/clients.json` and add an entry to the `clients` array. Production must
-provide the full client configuration through `CLIENTS_CONFIG_JSON` or an
-external `CONFIG_PATH`; never commit the populated file.
+`config/clients.json` and add an entry to the `clients` array. Production
+managed mode does not read this file or any JSON client configuration; all
+clients and encrypted credentials come directly from Supabase.
 
 ```json
 {
@@ -163,6 +162,24 @@ Run that migration in the Supabase SQL editor, set `SUPABASE_URL`, `SUPABASE_KEY
 the backend. The service hydrates the managed client records before starting
 cron. Passwords and GHL private integration keys are encrypted with AES-256-GCM
 before being written to Supabase and are never returned to the frontend.
+
+Apply the following additive column if it is not already present before deploying
+the current build:
+
+```sql
+alter table public.integration_clients
+  add column if not exists last_sync_stats jsonb not null default '{}'::jsonb;
+```
+
+Managed mode fails closed if Supabase cannot be initialized or the client table
+cannot be queried. It will not start with an empty legacy client list and will
+not silently display zero clients after a hydration failure. Check Render logs
+for `[Supabase] Hydrated N managed client(s).` after deployment.
+
+Managed startup probes `integration_clients` directly; the optional
+`server_logs` table is not required for client hydration. If one imported row
+cannot be decrypted, the remaining clients still load and that row is marked
+`CREDENTIAL_DECRYPTION_FAILED`/`invalid` until its credentials are replaced.
 
 The managed lifecycle endpoints are:
 

@@ -6,7 +6,7 @@
 require("dotenv").config();
 
 const express = require("express");
-const { loadConfig, getClients, setManagedClients } = require("./core/config");
+const { loadConfig, setManagedClients } = require("./core/config");
 const { startCron } = require("./scheduler/cron");
 const { closeAllSessions } = require("./sessions/sessionManager");
 const supabase = require("./core/supabase");
@@ -172,32 +172,32 @@ httpServer = app.listen(PORT, () => {
   // Initialize Supabase before starting cron so managed client status is
   // hydrated before the first scheduled execution can run.
   (async () => {
+    const managedMode = ["1", "true", "yes", "on"].includes(
+      String(process.env.MANAGED_CLIENTS_ENABLED || "").toLowerCase()
+    );
+    let managedModeReady = false;
     try {
       await supabase.initialize();
+      if (managedMode && !supabase.isEnabled()) {
+        throw new Error("Supabase is not initialized while MANAGED_CLIENTS_ENABLED=true.");
+      }
       if (supabase.isEnabled()) {
         logger.info("[Supabase] Initialized successfully.");
-        if (["1", "true", "yes", "on"].includes(String(process.env.MANAGED_CLIENTS_ENABLED || "").toLowerCase())) {
-          try {
-            const managedClients = await supabase.loadManagedClients();
-            const bootstrapClientCount = getClients().length;
-            if (managedClients.length === 0 && bootstrapClientCount > 0) {
-              logger.error(
-                `[Supabase] Managed client table is empty; retaining ${bootstrapClientCount} ` +
-                "external fallback client(s) and refusing to start managed mode with zero clients."
-              );
-            } else {
-              setManagedClients(managedClients);
-              logger.info(`[Supabase] Hydrated ${managedClients.length} managed client(s).`);
-            }
-          } catch (error) {
-            logger.error(`[Supabase] Managed client hydration failed: ${error.message}`);
-          }
-        }
+      }
+      if (managedMode) {
+        const managedClients = await supabase.loadManagedClients();
+        setManagedClients(managedClients);
+        managedModeReady = true;
+        logger.info(`[Supabase] Hydrated ${managedClients.length} managed client(s).`);
       }
     } catch (e) {
-      logger.warn(`[Supabase] Init error: ${e.message}`);
+      logger.error(`[Supabase] Startup failed: ${e.message}`);
+      if (managedMode) {
+        logger.error("[Server] Managed Supabase mode cannot start without a loaded client list. Exiting.");
+        process.exit(1);
+      }
     } finally {
-      startCron();
+      if (!managedMode || managedModeReady) startCron();
     }
   })();
 
