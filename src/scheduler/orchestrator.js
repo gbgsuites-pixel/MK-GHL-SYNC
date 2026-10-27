@@ -200,9 +200,6 @@ async function runFullSync(clients) {
           await supabase.completeClientResult(currentExecutionId, client.clientName, client.consultantNum, stats, null, reason);
         } catch (_) {}
 
-        currentExecution.clients.push(clientEntry);
-        results.push(clientEntry);
-        await cleanupClientSession(client);
         continue;
       }
 

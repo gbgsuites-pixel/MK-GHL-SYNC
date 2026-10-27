@@ -40,8 +40,10 @@ test('managed client secrets round-trip without plaintext persistence', () => {
 });
 
 test('custom-field normalization returns a stable name-to-ID map', () => {
+  const adminSource = fs.readFileSync(path.join(__dirname, '../src/core/ghlAdmin.js'), 'utf8');
+  assert.match(adminSource, /customFields\?model=contact/);
   const fields = normalizeCustomFields({ customFields: [
-    { id: 'field-career', name: 'Career Level' },
+    { id: 'field-career', name: '  Career   Level ' },
     { id: 'field-wholesale', name: 'Current Wholesale' },
   ] });
   assert.deepEqual(customFieldMap(fields), {
@@ -94,6 +96,12 @@ test('active-client selection excludes paused and disconnected records', () => {
     { id: 'disconnected', consultantNum: 'C1', status: 'disconnected' },
   ]);
   assert.deepEqual(config.getActiveClients().map(client => client.id), ['active']);
+});
+
+test('blocked clients are appended to execution state once', () => {
+  const orchestrator = fs.readFileSync(path.join(__dirname, '../src/scheduler/orchestrator.js'), 'utf8');
+  assert.equal((orchestrator.match(/currentExecution\.clients\.push\(clientEntry\)/g) || []).length, 1);
+  assert.equal((orchestrator.match(/results\.push\(clientEntry\)/g) || []).length, 1);
 });
 
 test('same-consultant session operations are serialized', async () => {

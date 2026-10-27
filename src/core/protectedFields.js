@@ -14,18 +14,35 @@ function normalizeFieldMap(value) {
   return value && typeof value === "object" ? value : {};
 }
 
+function normalizeFieldName(value) {
+  return String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function fieldIdMap(value) {
+  return Object.entries(normalizeFieldMap(value)).reduce((map, [name, id]) => {
+    const normalizedName = normalizeFieldName(name);
+    if (normalizedName && id) map[normalizedName] = id;
+    return map;
+  }, {});
+}
+
 function compareProtectedFieldMapping(storedMap, liveMap) {
   const stored = normalizeFieldMap(storedMap);
   const live = normalizeFieldMap(liveMap);
+  const storedIds = fieldIdMap(stored);
+  const liveIds = fieldIdMap(live);
   const missingFromStored = [];
   const missingFromLive = [];
   const changedIds = [];
 
   for (const fieldName of PROTECTED_CUSTOM_FIELDS) {
-    if (!stored[fieldName]) missingFromStored.push(fieldName);
-    if (!live[fieldName]) missingFromLive.push(fieldName);
-    if (stored[fieldName] && live[fieldName] && stored[fieldName] !== live[fieldName]) {
-      changedIds.push({ fieldName, storedId: stored[fieldName], liveId: live[fieldName] });
+    const normalizedName = normalizeFieldName(fieldName);
+    const storedId = storedIds[normalizedName];
+    const liveId = liveIds[normalizedName];
+    if (!storedId) missingFromStored.push(fieldName);
+    if (!liveId) missingFromLive.push(fieldName);
+    if (storedId && liveId && storedId !== liveId) {
+      changedIds.push({ fieldName, storedId, liveId });
     }
   }
 

@@ -11,8 +11,8 @@ function normalizeCustomFields(payload) {
   return candidates
     .map(field => ({
       id: field.id || field.fieldId || field.field_id,
-      name: field.name || field.fieldName || field.field_name,
-      objectKey: field.objectKey || field.object_key || null,
+      name: String(field.name || field.fieldName || field.field_name || "").trim().replace(/\s+/g, " "),
+      objectKey: field.objectKey || field.object_key || field.fieldKey || field.field_key || null,
       type: field.dataType || field.type || null
     }))
     .filter(field => field.id && field.name);
@@ -28,7 +28,7 @@ async function fetchLocationCustomFields(ghlApiToken, locationId) {
   let response;
   try {
     response = await axios.get(
-      `${GHL_BASE_URL}/locations/${encodeURIComponent(locationId)}/customFields`,
+      `${GHL_BASE_URL}/locations/${encodeURIComponent(locationId)}/customFields?model=contact`,
       {
         headers: {
           Authorization: `Bearer ${ghlApiToken}`,
