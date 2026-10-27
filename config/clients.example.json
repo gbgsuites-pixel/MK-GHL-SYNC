@@ -2,7 +2,7 @@
   "_schema": "mk-ghl-sync-client-config-v1",
   "clients": [
     {
-      "clientName": "Example Client",
+      "clientName": "Exambple Client",
       "consultantNum": "Z00000",
       "password": "REPLACE_IN_SECRET_STORE",
       "ghlApiToken": "REPLACE_IN_SECRET_STORE",
