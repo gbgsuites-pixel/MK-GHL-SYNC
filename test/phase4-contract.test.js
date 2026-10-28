@@ -43,8 +43,9 @@ test('managed client secrets round-trip without plaintext persistence', () => {
 
 test('custom-field normalization returns a stable name-to-ID map', () => {
   const adminSource = fs.readFileSync(path.join(__dirname, '../src/core/ghlAdmin.js'), 'utf8');
-  assert.match(adminSource, /customFields\?model=contact/);
-  assert.match(adminSource, /const GHL_VERSION = "v3"/);
+  assert.match(adminSource, /version: "v3", model: "contact"/);
+  assert.match(adminSource, /version: "2021-07-28", model: "contact"/);
+  assert.match(adminSource, /customFields\?model=\$\{variant\.model\}/);
   const fields = normalizeCustomFields({ customFields: [
     { id: 'field-career', name: '  Career   Level ' },
     { id: 'field-wholesale', name: 'Current Wholesale' },
@@ -53,6 +54,13 @@ test('custom-field normalization returns a stable name-to-ID map', () => {
     'Career Level': 'field-career',
     'Current Wholesale': 'field-wholesale',
   });
+});
+
+test('custom-field normalization supports nested responses and field keys', () => {
+  const fields = normalizeCustomFields({ data: { customFields: [
+    { id: 'field-activity', fieldKey: 'contact.Activity Status', model: 'contact' },
+  ] } });
+  assert.deepEqual(customFieldMap(fields), { 'Activity Status': 'field-activity' });
 });
 
 test('onboarding can identify incomplete protected-field mappings before storage', () => {
@@ -64,9 +72,10 @@ test('onboarding can identify incomplete protected-field mappings before storage
 test('managed client routes support GHL onboarding and permanent removal', () => {
   const routes = fs.readFileSync(path.join(__dirname, '../src/api/routes.js'), 'utf8');
   assert.match(routes, /fetchLocationCustomFields\(\s*input\.ghlApiToken/);
-  assert.match(routes, /const customFieldsMap = customFieldMap\(customFields\)/);
+  assert.match(routes, /customFieldMap\(customFields\)/);
   assert.match(routes, /input\.ghlCustomFields = customFieldsMap/);
   assert.match(routes, /GHL_PROTECTED_FIELDS_MISSING/);
+  assert.match(routes, /completeMappingFromSameLocation/);
   assert.match(routes, /router\.delete\("\/api\/v1\/clients\/\:id\/permanent"/);
   assert.match(routes, /supabase\.deleteManagedClient\(req\.params\.id\)/);
 });

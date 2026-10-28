@@ -28,7 +28,10 @@ const logger = require("../utils/logger");
 const supabase = require("../core/supabase");
 const { issueStreamTicket, validateStreamTicket } = require("../security/streamTickets");
 const { fetchLocationCustomFields, customFieldMap } = require("../core/ghlAdmin");
-const { missingProtectedFieldNames } = require("../core/protectedFields");
+const {
+  hasCompleteProtectedFieldMapping,
+  missingProtectedFieldNames
+} = require("../core/protectedFields");
 
 const router = express.Router();
 
@@ -106,6 +109,28 @@ async function refreshManagedClientCache() {
   const clients = await supabase.loadManagedClients();
   setManagedClients(clients);
   return clients;
+}
+
+async function completeMappingFromSameLocation(locationId, currentMap) {
+  const missing = missingProtectedFieldNames(currentMap);
+  if (missing.length === 0) return currentMap;
+
+  try {
+    const clients = await supabase.listManagedClients({ includeSecrets: false });
+    const trusted = clients.find((client) =>
+      String(client.locationId || "").trim() === String(locationId || "").trim() &&
+      hasCompleteProtectedFieldMapping(client.ghlCustomFields)
+    );
+    if (!trusted) return currentMap;
+
+    // Keep IDs returned by the live API, and fill only the names omitted by
+    // that response. IDs are location-scoped, so a mapping from another
+    // location is never used.
+    return { ...trusted.ghlCustomFields, ...currentMap };
+  } catch (error) {
+    logger.warn(`[API] Same-location custom-field mapping fallback unavailable: ${error.message}`);
+    return currentMap;
+  }
 }
 
 function managedClientResponse(client) {
@@ -280,7 +305,10 @@ router.post("/api/v1/clients", requireAuth, requireManagedClients, async (req, r
       input.ghlApiToken,
       input.ghlLocationId
     );
-    const customFieldsMap = customFieldMap(customFields);
+    const customFieldsMap = await completeMappingFromSameLocation(
+      input.ghlLocationId,
+      customFieldMap(customFields)
+    );
     const missingProtectedFields = missingProtectedFieldNames(customFieldsMap);
     if (missingProtectedFields.length > 0) {
       const error = new Error(
@@ -321,7 +349,10 @@ router.post("/api/v1/clients/:id/validate-credentials", requireAuth, requireMana
       managedClient.ghlApiToken,
       managedClient.locationId
     );
-    const fieldsMap = customFieldMap(fields);
+    const fieldsMap = await completeMappingFromSameLocation(
+      managedClient.locationId,
+      { ...managedClient.ghlCustomFields, ...customFieldMap(fields) }
+    );
     const missingProtectedFields = missingProtectedFieldNames(fieldsMap);
     if (missingProtectedFields.length > 0) {
       const error = new Error(
