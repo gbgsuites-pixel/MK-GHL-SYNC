@@ -28,6 +28,7 @@ const logger = require("../utils/logger");
 const supabase = require("../core/supabase");
 const { issueStreamTicket, validateStreamTicket } = require("../security/streamTickets");
 const { fetchLocationCustomFields, customFieldMap } = require("../core/ghlAdmin");
+const { missingProtectedFieldNames } = require("../core/protectedFields");
 
 const router = express.Router();
 
@@ -279,7 +280,17 @@ router.post("/api/v1/clients", requireAuth, requireManagedClients, async (req, r
       input.ghlApiToken,
       input.ghlLocationId
     );
-    input.ghlCustomFields = customFieldMap(customFields);
+    const customFieldsMap = customFieldMap(customFields);
+    const missingProtectedFields = missingProtectedFieldNames(customFieldsMap);
+    if (missingProtectedFields.length > 0) {
+      const error = new Error(
+        `GoHighLevel returned an incomplete contact-field mapping. Missing: ${missingProtectedFields.join(", ")}.`
+      );
+      error.code = "GHL_PROTECTED_FIELDS_MISSING";
+      error.fields = missingProtectedFields;
+      throw error;
+    }
+    input.ghlCustomFields = customFieldsMap;
     const created = await supabase.createManagedClient(input);
     await refreshManagedClientCache();
     res.status(201).json({
@@ -310,6 +321,16 @@ router.post("/api/v1/clients/:id/validate-credentials", requireAuth, requireMana
       managedClient.ghlApiToken,
       managedClient.locationId
     );
+    const fieldsMap = customFieldMap(fields);
+    const missingProtectedFields = missingProtectedFieldNames(fieldsMap);
+    if (missingProtectedFields.length > 0) {
+      const error = new Error(
+        `GoHighLevel returned an incomplete contact-field mapping. Missing: ${missingProtectedFields.join(", ")}.`
+      );
+      error.code = "GHL_PROTECTED_FIELDS_MISSING";
+      error.fields = missingProtectedFields;
+      throw error;
+    }
     await invalidateSession(managedClient.consultantNum);
 
     const updated = await supabase.updateManagedClient(req.params.id, {
@@ -317,7 +338,7 @@ router.post("/api/v1/clients/:id/validate-credentials", requireAuth, requireMana
       validationStatus: "valid",
       validationErrorCode: null,
       lastValidationAt: new Date().toISOString(),
-      ghlCustomFields: customFieldMap(fields)
+      ghlCustomFields: fieldsMap
     });
     await refreshManagedClientCache();
     res.json({ client: managedClientResponse(updated), customFieldCount: fields.length });

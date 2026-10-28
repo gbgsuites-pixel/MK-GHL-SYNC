@@ -196,9 +196,12 @@ POST   /api/v1/clients/:id/sync
 
 Creating a client requires `clientName`, `consultantNum`, `password`,
 `ghlApiToken`, and `ghlLocationId`. The create endpoint performs a read-only
-GoHighLevel custom-field lookup and stores the returned name-to-ID map with the
-encrypted client record. New clients start as `pending_validation`; use the
-validation action to run the read-only Mary Kay session check. Only `active`
+GoHighLevel v3 contact custom-field lookup and stores the returned name-to-ID
+map with the encrypted client record. The onboarding and validation routes
+reject incomplete mappings for the protected contact fields before a client can
+be activated, so a newly added client does not require a manual SQL field repair.
+New clients start as `pending_validation`; use the validation action to run the
+read-only Mary Kay session check. Only `active`
 clients participate in manual full syncs and scheduled syncs. `paused`,
 `invalid`, `disconnected`, and `removal_pending` clients are excluded.
 

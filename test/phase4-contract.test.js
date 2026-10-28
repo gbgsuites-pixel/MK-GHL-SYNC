@@ -16,6 +16,7 @@ const {
   PROTECTED_CUSTOM_FIELDS,
   compareProtectedFieldMapping,
   hasCompleteProtectedFieldMapping,
+  missingProtectedFieldNames,
   inspectProtectedFieldSource,
 } = require('../src/core/protectedFields');
 const { buildCustomFieldsPayload } = require('../src/sync/ghlSync');
@@ -43,6 +44,7 @@ test('managed client secrets round-trip without plaintext persistence', () => {
 test('custom-field normalization returns a stable name-to-ID map', () => {
   const adminSource = fs.readFileSync(path.join(__dirname, '../src/core/ghlAdmin.js'), 'utf8');
   assert.match(adminSource, /customFields\?model=contact/);
+  assert.match(adminSource, /const GHL_VERSION = "v3"/);
   const fields = normalizeCustomFields({ customFields: [
     { id: 'field-career', name: '  Career   Level ' },
     { id: 'field-wholesale', name: 'Current Wholesale' },
@@ -53,11 +55,19 @@ test('custom-field normalization returns a stable name-to-ID map', () => {
   });
 });
 
+test('onboarding can identify incomplete protected-field mappings before storage', () => {
+  const incomplete = { 'Activity Status': 'field-activity' };
+  assert.equal(hasCompleteProtectedFieldMapping(incomplete), false);
+  assert.deepEqual(missingProtectedFieldNames(incomplete), PROTECTED_CUSTOM_FIELDS.slice(1));
+});
+
 test('managed client routes support GHL onboarding and permanent removal', () => {
   const routes = fs.readFileSync(path.join(__dirname, '../src/api/routes.js'), 'utf8');
   assert.match(routes, /fetchLocationCustomFields\(\s*input\.ghlApiToken/);
-  assert.match(routes, /input\.ghlCustomFields = customFieldMap\(customFields\)/);
-  assert.match(routes, /router\.delete\("\/api\/v1\/clients\/:id\/permanent"/);
+  assert.match(routes, /const customFieldsMap = customFieldMap\(customFields\)/);
+  assert.match(routes, /input\.ghlCustomFields = customFieldsMap/);
+  assert.match(routes, /GHL_PROTECTED_FIELDS_MISSING/);
+  assert.match(routes, /router\.delete\("\/api\/v1\/clients\/\:id\/permanent"/);
   assert.match(routes, /supabase\.deleteManagedClient\(req\.params\.id\)/);
 });
 

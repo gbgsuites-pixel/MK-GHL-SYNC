@@ -1,17 +1,29 @@
 const axios = require("axios");
 
 const GHL_BASE_URL = "https://services.leadconnectorhq.com";
-const GHL_VERSION = "2021-07-28";
+// The current locations custom-fields endpoint expects the v3 API version.
+// The legacy 2021-07-28 header can return an incomplete field collection for
+// contact-model lookups, which makes a newly onboarded client fail protected
+// field validation even when the fields exist in the location.
+const GHL_VERSION = "v3";
 
 function normalizeCustomFields(payload) {
   const candidates = Array.isArray(payload)
     ? payload
-    : payload?.customFields || payload?.custom_fields || payload?.data || [];
+    : Array.isArray(payload?.customFields)
+    ? payload.customFields
+    : Array.isArray(payload?.custom_fields)
+    ? payload.custom_fields
+    : Array.isArray(payload?.data)
+    ? payload.data
+    : Array.isArray(payload?.customFields?.customFields)
+    ? payload.customFields.customFields
+    : [];
 
   return candidates
     .map(field => ({
       id: field.id || field.fieldId || field.field_id,
-      name: String(field.name || field.fieldName || field.field_name || "").trim().replace(/\s+/g, " "),
+      name: String(field.name || field.fieldName || field.field_name || field.label || "").trim().replace(/\s+/g, " "),
       objectKey: field.objectKey || field.object_key || field.fieldKey || field.field_key || null,
       type: field.dataType || field.type || null
     }))

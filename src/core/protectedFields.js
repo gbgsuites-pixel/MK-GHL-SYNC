@@ -31,6 +31,11 @@ function hasCompleteProtectedFieldMapping(value) {
   return PROTECTED_CUSTOM_FIELDS.every((fieldName) => Boolean(ids[normalizeFieldName(fieldName)]));
 }
 
+function missingProtectedFieldNames(value) {
+  const ids = fieldIdMap(value);
+  return PROTECTED_CUSTOM_FIELDS.filter((fieldName) => !ids[normalizeFieldName(fieldName)]);
+}
+
 function compareProtectedFieldMapping(storedMap, liveMap) {
   const stored = normalizeFieldMap(storedMap);
   const live = normalizeFieldMap(liveMap);
@@ -115,5 +120,6 @@ module.exports = {
   PROTECTED_CUSTOM_FIELDS,
   compareProtectedFieldMapping,
   hasCompleteProtectedFieldMapping,
+  missingProtectedFieldNames,
   inspectProtectedFieldSource
 };
