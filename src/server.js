@@ -6,7 +6,12 @@
 require("dotenv").config();
 
 const express = require("express");
-const { loadConfig, setManagedClients } = require("./core/config");
+const {
+  loadConfig,
+  setManagedClients,
+  setDurableSchedule,
+  setDurableScheduleStore
+} = require("./core/config");
 const { startCron } = require("./scheduler/cron");
 const { closeAllSessions } = require("./sessions/sessionManager");
 const supabase = require("./core/supabase");
@@ -189,6 +194,20 @@ httpServer = app.listen(PORT, () => {
         setManagedClients(managedClients);
         managedModeReady = true;
         logger.info(`[Supabase] Hydrated ${managedClients.length} managed client(s).`);
+      }
+      if (supabase.isEnabled()) {
+        // Restore the schedule from durable storage. Render's disk is wiped on
+        // restart, which previously left the cron silently disabled.
+        setDurableScheduleStore({ save: supabase.saveSchedule });
+        try {
+          const storedSchedule = await supabase.loadSchedule();
+          setDurableSchedule(storedSchedule);
+          logger.info(storedSchedule
+            ? "[Supabase] Restored persisted sync schedule."
+            : "[Supabase] No persisted sync schedule; using defaults (enabled unless SCHEDULE_ENABLED=false).");
+        } catch (e) {
+          logger.error(`[Supabase] Could not load persisted schedule; using defaults: ${e.message}`);
+        }
       }
     } catch (e) {
       logger.error(`[Supabase] Startup failed: ${e.message}`);

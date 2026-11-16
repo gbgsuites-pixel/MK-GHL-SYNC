@@ -162,6 +162,15 @@ function parseAuraRequest(request) {
   }
 }
 
+function siteUnavailableError(httpStatus) {
+  const error = new Error(
+    `Mary Kay InTouch is unavailable (maintenance page${httpStatus ? `, HTTP ${httpStatus}` : ""}).`
+  );
+  error.code = "MK_SITE_UNAVAILABLE";
+  error.retryable = true;
+  return error;
+}
+
 function isCacheValid(consultantNum) {
   const entry = sessionCache[consultantNum];
   if (!entry || !entry.valid) return false;
@@ -219,10 +228,25 @@ async function loginAndGetSession(consultantNum, password) {
 
     // ── STEP 1: Navigate to login page ──
     logger.info(`[Login] Navigating to login page...`);
-    await page.goto(LOGIN_URL, {
+    const loginResponse = await page.goto(LOGIN_URL, {
       waitUntil: "networkidle2",
       timeout: 90000
     });
+
+    // Mary Kay serves a "Site Unavailable" splash page (and a 404 for the
+    // login path) during maintenance. Detect it and fail fast instead of
+    // waiting for a login form that will never appear.
+    const siteUnavailable = await page.evaluate(() => {
+      const marker = document.querySelector('meta[name="comment"]');
+      return Boolean(
+        (marker && /MKSPLASHACTIVE/i.test(marker.content || "")) ||
+        document.querySelector('meta[name="splash-enabled"][content="true"]') ||
+        /site unavailable/i.test(document.title || "")
+      );
+    }).catch(() => false);
+    if (siteUnavailable || (loginResponse && loginResponse.status() === 404)) {
+      throw siteUnavailableError(loginResponse ? loginResponse.status() : null);
+    }
 
     // ── STEP 2: Fill credentials ──
     logger.info(`[Login] Filling credentials...`);
@@ -507,6 +531,13 @@ async function getSessionUnlocked(consultantNum, password, forceRefresh = false)
 
   logger.info(`[Session] Cache miss — logging in for ${key}...`);
 
+  // A forced refresh replaces the cached browser; close the old one first so
+  // its Chromium process and profile directory are not leaked.
+  if (sessionCache[key]) {
+    await invalidateSessionUnlocked(key);
+  }
+
+  let lastError = null;
   for (let retry = 1; retry <= LOGIN_MAX_RETRIES; retry++) {
     try {
       const session = await loginAndGetSession(key, password);
@@ -520,7 +551,11 @@ async function getSessionUnlocked(consultantNum, password, forceRefresh = false)
       logger.info(`[Session] Successfully obtained fresh session for ${key}`);
       return { ...session, fromCache: false };
     } catch (err) {
+      lastError = err;
       logger.error(`[Session] Login attempt ${retry}/${LOGIN_MAX_RETRIES} failed for ${key}: ${err.message}`);
+      // Retrying cannot help while the site is in maintenance, and repeated
+      // wrong-password attempts risk locking the consultant's account.
+      if (err.code === "MK_SITE_UNAVAILABLE" || /still on login page/i.test(err.message)) break;
       if (retry < LOGIN_MAX_RETRIES) {
         logger.info(`[Session] Retrying in ${LOGIN_RETRY_DELAY_MS / 1000}s...`);
         await sleep(LOGIN_RETRY_DELAY_MS);
@@ -528,7 +563,12 @@ async function getSessionUnlocked(consultantNum, password, forceRefresh = false)
     }
   }
 
-  throw new Error(`Login failed for ${key} after ${LOGIN_MAX_RETRIES} attempts.`);
+  const error = new Error(`Login failed for ${key}: ${lastError?.message || "unknown error"}`);
+  error.code = lastError?.code || (/still on login page/i.test(lastError?.message || "")
+    ? "MK_LOGIN_REJECTED"
+    : "MK_LOGIN_FAILED");
+  error.retryable = error.code !== "MK_LOGIN_REJECTED";
+  throw error;
 }
 
 async function getSession(consultantNum, password, forceRefresh = false) {

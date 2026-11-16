@@ -189,20 +189,21 @@ async function createExecution(triggeredBy, totalClients) {
   if (!isInitialized) return null;
   const client = supabaseClient();
 
+  // Ask PostgREST to return the inserted row so the ID is exactly this run's,
+  // rather than "whichever execution started most recently".
   const res = await client.post("/rest/v1/sync_executions", {
-    triggered_by: triggeredBy || "cron",
+    triggered_by: triggeredBy || "manual",
     total_clients: totalClients,
     status: "running"
-  });
+  }, { headers: { Prefer: "return=representation" } });
 
   if (res.status >= 300) {
     logger.warn(`[Supabase] createExecution failed: HTTP ${res.status}`);
     return null;
   }
 
-  // Get the inserted ID
-  const { data } = await client.get("/rest/v1/sync_executions?select=id&order=started_at.desc&limit=1");
-  return data && data.length > 0 ? data[0].id : null;
+  const row = Array.isArray(res.data) ? res.data[0] : res.data;
+  return row && row.id ? row.id : null;
 }
 
 async function completeExecution(executionId, summary) {
@@ -210,15 +211,18 @@ async function completeExecution(executionId, summary) {
   const client = supabaseClient();
 
   const durationSec = Math.round((new Date(summary.endTime) - new Date(summary.startTime)) / 1000);
-  const successCount = (summary.results || []).filter(r => r.status === "completed").length;
-  const failCount = (summary.results || []).filter(r => r.status === "failed").length;
+  const results = summary.results || [];
+  const successCount = results.filter(r => ["completed", "partial_success"].includes(r.status)).length;
+  const failCount = results.filter(r => ["failed", "blocked"].includes(r.status)).length;
 
-  const res = await client.patch(`/rest/v1/sync_executions?id=eq.${executionId}`, {
+  // Record the real outcome. This was hard-coded to "completed", so a run in
+  // which every client failed looked successful in the history.
+  const res = await client.patch(`/rest/v1/sync_executions?id=eq.${encodeURIComponent(executionId)}`, {
     ended_at: summary.endTime,
     duration_sec: durationSec,
     success_count: successCount,
     fail_count: failCount,
-    status: "completed"
+    status: summary.status || "completed"
   });
 
   if (res.status >= 300) {
@@ -249,7 +253,7 @@ async function completeClientResult(executionId, clientName, consultantNum, stat
   const client2 = supabaseClient();
 
   const updates = {
-    status: error ? "failed" : "completed",
+    status: error ? (stats?.blocked ? "blocked" : "failed") : "completed",
     ended_at: new Date().toISOString(),
     error_message: error || null,
     consultant_count: stats?.consultantListCount || 0,
@@ -667,8 +671,50 @@ async function loadManagedClients() {
   });
 }
 
+// ── Durable settings (integration_settings key/value table) ──
+const SCHEDULE_SETTING_KEY = "sync_schedule";
+
+async function loadSetting(key) {
+  if (!isInitialized) return null;
+  const client = supabaseClient();
+  const res = await client.get(
+    `/rest/v1/integration_settings?select=value&key=eq.${encodeURIComponent(key)}&limit=1`
+  );
+  if (res.status >= 300) {
+    const error = new Error(
+      `Settings read failed with HTTP ${res.status}. Apply migrations/VA-3379 - security lockdown and settings.sql.`
+    );
+    error.code = "SETTINGS_UNAVAILABLE";
+    throw error;
+  }
+  return Array.isArray(res.data) && res.data.length > 0 ? res.data[0].value : null;
+}
+
+async function saveSetting(key, value) {
+  ensureSupabaseForManagedClients();
+  const client = supabaseClient();
+  const res = await client.post(
+    "/rest/v1/integration_settings?on_conflict=key",
+    { key, value, updated_at: new Date().toISOString() },
+    { headers: { Prefer: "resolution=merge-duplicates,return=minimal" } }
+  );
+  if (res.status >= 300) {
+    const error = new Error(
+      `Settings write failed with HTTP ${res.status}. Apply migrations/VA-3379 - security lockdown and settings.sql.`
+    );
+    error.code = "SETTINGS_UNAVAILABLE";
+    throw error;
+  }
+  return true;
+}
+
+const loadSchedule = () => loadSetting(SCHEDULE_SETTING_KEY);
+const saveSchedule = (schedule) => saveSetting(SCHEDULE_SETTING_KEY, schedule);
+
 // ── Public API ──
 module.exports = {
+  loadSchedule,
+  saveSchedule,
   initialize,
   isEnabled,
   queueLogEntry,

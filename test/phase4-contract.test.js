@@ -2,6 +2,26 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
+
+// Tests must not depend on the gitignored local config/clients.json (CI has
+// none). Supply a minimal in-memory client config and an isolated schedule path.
+process.env.CLIENTS_CONFIG_JSON = JSON.stringify({
+  clients: [{
+    clientName: 'Test Client',
+    consultantNum: 'T00001',
+    password: 'test-password',
+    ghlApiToken: 'test-token',
+    ghlLocationId: 'test-location',
+    ghlCustomFields: {},
+  }],
+  _serverConfig: {},
+});
+process.env.SCHEDULE_CONFIG_PATH = path.join(
+  fs.mkdtempSync(path.join(os.tmpdir(), 'mk-ghl-test-')),
+  'schedule.json'
+);
+delete process.env.SCHEDULE_ENABLED;
 
 const {
   encryptSecrets,
@@ -159,4 +179,69 @@ test('cron start is idempotent for the configured schedule', () => {
   assert.deepEqual(second, first);
   cronScheduler.stopCron();
   assert.equal(cronScheduler.isRunning(), false);
+});
+
+test('schedule defaults to enabled when nothing has been persisted', () => {
+  config.setDurableSchedule(null);
+  const schedule = config.getScheduleConfig();
+  assert.equal(schedule.enabled, true);
+  assert.equal(schedule.cron, '30 0 * * *');
+  assert.equal(schedule.timezone, 'America/Chicago');
+});
+
+test('durable schedule overrides defaults and survives a lost local file', async () => {
+  const saved = [];
+  config.setDurableScheduleStore({ save: async (value) => { saved.push(value); } });
+  try {
+    const next = await config.persistSchedule({ enabled: false, cron: '0 6 * * *' });
+    assert.equal(next.enabled, false);
+    assert.equal(saved.length, 1);
+    assert.deepEqual(saved[0], next);
+
+    // Simulate a Render restart: local file gone, durable value reloaded.
+    fs.rmSync(process.env.SCHEDULE_CONFIG_PATH, { force: true });
+    config.setDurableSchedule(saved[0]);
+    assert.equal(config.getScheduleConfig().enabled, false);
+    assert.equal(config.getScheduleConfig().cron, '0 6 * * *');
+  } finally {
+    config.setDurableScheduleStore(null);
+    config.setDurableSchedule(null);
+  }
+});
+
+test('a failed durable save is surfaced instead of reported as saved', async () => {
+  config.setDurableScheduleStore({ save: async () => { throw new Error('settings table missing'); } });
+  try {
+    await assert.rejects(config.persistSchedule({ enabled: true }), /settings table missing/);
+  } finally {
+    config.setDurableScheduleStore(null);
+  }
+});
+
+test('blocked sync keeps the previous protected-field baseline', async () => {
+  const supabase = require('../src/core/supabase');
+  const { _persistManagedClientSyncResult } = require('../src/scheduler/orchestrator');
+  const original = supabase.updateManagedClient;
+  const writes = [];
+  supabase.updateManagedClient = async (id, patch) => { writes.push(patch); return {}; };
+  try {
+    const baseline = { 'Career Level': { providedCount: 40 } };
+    const client = { id: 'c1', clientName: 'C', lastSyncStats: { protectedFields: baseline } };
+
+    await _persistManagedClientSyncResult(client, 'blocked', {
+      message: 'Mary Kay login failed', stats: { blocked: true, errorCode: 'MK_SITE_UNAVAILABLE' },
+    });
+    assert.deepEqual(writes[0].lastSyncStats.protectedFields, baseline);
+    assert.equal(writes[0].lastSyncStats.errorCode, 'MK_SITE_UNAVAILABLE');
+    // The cached client object is refreshed in place.
+    assert.equal(client.lastSyncStatus, 'blocked');
+
+    const fresh = { 'Career Level': { providedCount: 42 } };
+    await _persistManagedClientSyncResult(client, 'completed', {
+      stats: { protectedFieldStats: fresh },
+    });
+    assert.deepEqual(writes[1].lastSyncStats.protectedFields, fresh);
+  } finally {
+    supabase.updateManagedClient = original;
+  }
 });

@@ -20,7 +20,8 @@ const {
 const { runFullSync, runSingleClientSync, getExecutionState, isRunning } = require("../scheduler/orchestrator");
 const { getCacheStatus, getSession, invalidateSession } = require("../sessions/sessionManager");
 const { fetchRawData, fetchProcessedContacts, validateAllData, exportAllLists, exportGhlReadyContacts, exportGhlReadyCsv } = require("../processors/diagnostics");
-const { startCron, stopCron, restartCron } = require("../scheduler/cron");
+const { startCron, stopCron, restartCron, isRunning: cronIsActive } = require("../scheduler/cron");
+const nodeCron = require("node-cron");
 const { getProgressStream, subscribeProgress } = require("../scheduler/progress.js");
 const fs = require("fs");
 const path = require("path");
@@ -450,7 +451,7 @@ router.post("/api/v1/clients/:id/sync", requireAuth, requireManagedClients, asyn
   if (client.status !== "active") {
     return res.status(409).json({ error: `Client is ${client.status || "inactive"}. Activate it before syncing.` });
   }
-  runSingleClientSync(client).catch(err => logger.error(`[API] Managed client sync failed: ${err.message}`));
+  runSingleClientSync(client, { triggeredBy: "manual" }).catch(err => logger.error(`[API] Managed client sync failed: ${err.message}`));
   res.json({ status: "started", client: managedClientResponse(client) });
 });
 
@@ -476,7 +477,7 @@ router.post("/api/sync/all", requireAuth, async (req, res) => {
   const clients = getActiveClients();
   logger.info("[API] Full sync triggered via API.");
 
-  const syncPromise = runFullSync(clients);
+  const syncPromise = runFullSync(clients, { triggeredBy: "manual" });
   syncPromise.catch(err => {
     logger.error(`[API] Full sync failed: ${err.message}`);
   });
@@ -506,7 +507,7 @@ router.post("/api/sync/:consultantNum", requireAuth, async (req, res) => {
 
   logger.info(`[API] Single client sync triggered: ${client.clientName}`);
 
-  const syncPromise = runSingleClientSync(client);
+  const syncPromise = runSingleClientSync(client, { triggeredBy: "manual" });
   syncPromise.catch(err => {
     logger.error(`[API] Single client sync failed: ${err.message}`);
   });
@@ -709,7 +710,11 @@ router.get("/api/schedule", requireAuth, (req, res) => {
     res.json({
       cron:       schedule.cron || "30 0 * * *",
       timezone:   schedule.timezone || "America/Chicago",
-      enabled:    schedule.enabled !== false,
+      // Report the stored setting and whether the cron job is actually
+      // running. Previously an unset value was reported as enabled while the
+      // scheduler was off.
+      enabled:    schedule.enabled === true,
+      active:     cronIsActive(),
       clients:    getClients().length
     });
   } catch (e) {
@@ -720,12 +725,24 @@ router.get("/api/schedule", requireAuth, (req, res) => {
 // ── POST /api/schedule — Update schedule configuration ──
 router.post("/api/schedule", requireAuth, async (req, res) => {
   try {
-    const { cron, timezone, enabled } = req.body;
+    const { cron, timezone, enabled } = req.body || {};
     const patch = {};
-    if (cron !== undefined) patch.cron = cron;
-    if (timezone !== undefined) patch.timezone = timezone;
-    if (enabled !== undefined) patch.enabled = enabled;
-    const schedule = persistSchedule(patch);
+    if (cron !== undefined) {
+      if (!nodeCron.validate(String(cron))) {
+        return res.status(400).json({ error: `Invalid cron expression: ${cron}` });
+      }
+      patch.cron = String(cron);
+    }
+    if (timezone !== undefined) {
+      try {
+        new Intl.DateTimeFormat("en-US", { timeZone: String(timezone) });
+      } catch (_) {
+        return res.status(400).json({ error: `Invalid timezone: ${timezone}` });
+      }
+      patch.timezone = String(timezone);
+    }
+    if (enabled !== undefined) patch.enabled = enabled === true || enabled === "true";
+    const schedule = await persistSchedule(patch);
     logger.info(`[API] Schedule updated: ${schedule.cron} (${schedule.timezone}) [enabled: ${schedule.enabled}]`);
 
     // Restart cron with the persisted schedule. Client secrets are never
@@ -763,9 +780,9 @@ router.get("/api/progress", (req, res, next) => requireStreamTicket("progress", 
 });
 
 // ── POST /api/cron/enable — Enable scheduled sync ──
-router.post("/api/cron/enable", requireAuth, (req, res) => {
+router.post("/api/cron/enable", requireAuth, async (req, res) => {
   try {
-    persistSchedule({ enabled: true });
+    await persistSchedule({ enabled: true });
     startCron();
 
     res.json({ status: "enabled", message: "Scheduled sync enabled." });
@@ -775,9 +792,9 @@ router.post("/api/cron/enable", requireAuth, (req, res) => {
 });
 
 // ── POST /api/cron/disable — Disable scheduled sync ──
-router.post("/api/cron/disable", requireAuth, (req, res) => {
+router.post("/api/cron/disable", requireAuth, async (req, res) => {
   try {
-    persistSchedule({ enabled: false });
+    await persistSchedule({ enabled: false });
     stopCron();
 
     res.json({ status: "disabled", message: "Scheduled sync disabled." });

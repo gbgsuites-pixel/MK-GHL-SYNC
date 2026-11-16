@@ -53,23 +53,45 @@ async function cleanupClientSession(client) {
 async function persistManagedClientSyncResult(client, status, details = {}) {
   if (!client?.id || typeof supabase.updateManagedClient !== "function") return;
   const stats = details.stats || {};
+  const previousStats = client.lastSyncStats && typeof client.lastSyncStats === "object"
+    ? client.lastSyncStats
+    : {};
+  // Only an upload that actually ran may replace the protected-field
+  // baseline. A blocked/failed run (login failure, maintenance, source error)
+  // computed no field counts; writing {} here would silently disable the
+  // interrupted-field safety check on the next sync.
+  const uploadRan = status === "completed" || status === "partial_success";
+  const computedFieldStats = details.protectedFieldStats || stats.protectedFieldStats;
+  const protectedFields = uploadRan && computedFieldStats
+    ? computedFieldStats
+    : (previousStats.protectedFields || {});
+  const lastSyncAt = new Date().toISOString();
+  const lastSyncStats = {
+    contacts: Number(details.contacts) || 0,
+    synced: Number(details.synced) || 0,
+    errors: Number(details.errors) || 0,
+    skipped: Number(details.skipped) || 0,
+    consultants: Number(stats.consultantListCount) || 0,
+    customers: Number(stats.customerListCount) || 0,
+    message: details.message || null,
+    errorCode: stats.errorCode || details.errorCode || null,
+    protectedFieldAlerts: details.protectedFieldAlerts || stats.protectedFieldAlerts || [],
+    protectedFieldWarnings: details.protectedFieldWarnings || stats.protectedFieldWarnings || [],
+    protectedFields,
+    lastSuccessfulSyncAt: uploadRan ? lastSyncAt : (previousStats.lastSuccessfulSyncAt || null)
+  };
   try {
     await supabase.updateManagedClient(client.id, {
-      lastSyncAt: new Date().toISOString(),
+      lastSyncAt,
       lastSyncStatus: status,
-      lastSyncStats: {
-        contacts: Number(details.contacts) || 0,
-        synced: Number(details.synced) || 0,
-        errors: Number(details.errors) || 0,
-        skipped: Number(details.skipped) || 0,
-        consultants: Number(stats.consultantListCount) || 0,
-        customers: Number(stats.customerListCount) || 0,
-        message: details.message || null,
-        protectedFieldAlerts: details.protectedFieldAlerts || stats.protectedFieldAlerts || [],
-        protectedFieldWarnings: details.protectedFieldWarnings || stats.protectedFieldWarnings || [],
-        protectedFields: details.protectedFieldStats || stats.protectedFieldStats || {}
-      }
+      lastSyncStats
     });
+    // `client` is the same object held in the managed-client cache, so the
+    // dashboard and the next run's baseline see the new values without a
+    // restart.
+    client.lastSyncAt = lastSyncAt;
+    client.lastSyncStatus = status;
+    client.lastSyncStats = lastSyncStats;
   } catch (error) {
     logger.warn(`[Orchestrator] Could not persist last-sync metrics for ${client.clientName}: ${error.message}`);
   }
@@ -79,13 +101,25 @@ async function persistManagedClientSyncResult(client, status, details = {}) {
  * Safe wrapper to ensure the orchestrator never crashes from Puppeteer errors.
  * All client processing is wrapped in a try/catch that logs and continues.
  */
-async function runFullSync(clients) {
+async function runFullSync(clients, options = {}) {
   if (isRunning) {
     logger.warn(`[Orchestrator] Sync already in progress. Ignoring new trigger.`);
     return { status: "already_running" };
   }
 
   isRunning = true;
+  try {
+    return await runFullSyncUnguarded(clients, options);
+  } finally {
+    // Always release the lock, even if an unexpected error escapes; otherwise
+    // every later sync is refused until the process restarts.
+    isRunning = false;
+    currentExecutionId = null;
+  }
+}
+
+async function runFullSyncUnguarded(clients, options = {}) {
+  const triggeredBy = options.triggeredBy || "manual";
   const execStartTime = new Date();
 
   currentExecution = {
@@ -98,7 +132,7 @@ async function runFullSync(clients) {
 
   // ── Supabase: Create execution record ──
   try {
-    currentExecutionId = await supabase.createExecution("cron", clients.length);
+    currentExecutionId = await supabase.createExecution(triggeredBy, clients.length);
     currentExecution.executionId = currentExecutionId;
     if (currentExecutionId) {
       await supabase.recordServerEvent("sync_started", {
@@ -187,6 +221,16 @@ async function runFullSync(clients) {
         clientEntry.status = blocked ? "blocked" : "no_contacts";
         clientEntry.error = reason;
         failClient(client.clientName, reason);
+        if (blocked) {
+          logger.error(`>>> ${client.clientName} BLOCKED: ${reason}`, {
+            category: "sync",
+            operation: "client_sync",
+            status: "blocked",
+            errorCode: stats.errorCode || "CLIENT_SYNC_BLOCKED",
+            clientId: client.id || client.consultantNum,
+            executionId: currentExecutionId
+          });
+        }
         await persistManagedClientSyncResult(client, clientEntry.status, {
           contacts: 0,
           errors: blocked ? 1 : 0,
@@ -353,8 +397,6 @@ async function runFullSync(clients) {
   });
   logger.info(`═══════════════════════════════════════════════════════\n`);
 
-  isRunning = false;
-
   const summary = {
     status:    summaryStatus,
     startTime: execStartTime.toISOString(),
@@ -384,21 +426,20 @@ async function runFullSync(clients) {
     logger.warn(`[Orchestrator] Supabase completeExecution failed: ${e.message}`);
   }
 
-  currentExecutionId = null;
-
   return summary;
 }
 
 /**
  * Run sync for a single client.
  */
-async function runSingleClientSync(client) {
-  return runFullSync([client]);
+async function runSingleClientSync(client, options = {}) {
+  return runFullSync([client], options);
 }
 
 module.exports = {
   runFullSync,
   runSingleClientSync,
   getExecutionState,
+  _persistManagedClientSyncResult: persistManagedClientSyncResult,
   isRunning: () => isRunning
 };
