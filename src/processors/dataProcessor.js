@@ -780,8 +780,19 @@ async function processClient(client) {
   try {
     pageSession = await getSession(client.consultantNum, client.password, false);
   } catch (e) {
-    stats.errors.push(`Session failed: ${e.message}`);
-    logger.error(`ERROR: Could not obtain session for ${client.clientName}. Skipping.`);
+    // A login failure must be reported as a blocked client, not as a
+    // successful run that happened to find no contacts.
+    stats.blocked = true;
+    stats.errorCode = e.code || "MK_LOGIN_FAILED";
+    stats.errors.push(`Mary Kay login failed: ${e.message}`);
+    logger.error(`ERROR: Could not obtain session for ${client.clientName}. Skipping.`, {
+      category: "auth",
+      operation: "mk_login",
+      status: "blocked",
+      errorCode: stats.errorCode,
+      clientId: client.id || client.consultantNum,
+      retryable: true
+    });
     return { contacts: [], stats };
   }
 

@@ -154,6 +154,15 @@ Edit the `_serverConfig` section in `config/clients.json`:
 
 After editing config, restart the server or call `POST /api/config/reload`.
 
+In managed (Supabase) mode the schedule is stored in the `integration_settings`
+table (key `sync_schedule`), so it survives Render restarts and redeploys.
+Apply `migrations/VA-3379 - security lockdown and settings.sql` before
+deploying. When no schedule has been saved, the cron is **enabled** with
+`30 0 * * *` in `America/Chicago`; override the defaults with
+`SCHEDULE_ENABLED`, `SCHEDULE_CRON`, and `SCHEDULE_TIMEZONE`.
+`GET /api/schedule` returns both the stored `enabled` value and `active`
+(whether the cron job is actually running).
+
 ### Supabase-managed clients
 
 Phase 2 adds encrypted client management in `migrations/VA-3379 - integration_clients.sql`.

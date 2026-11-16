@@ -194,12 +194,44 @@ function reloadConfig() {
   return loadConfig();
 }
 
+// Schedule state loaded from durable storage (Supabase integration_settings).
+// Render's filesystem is ephemeral, so the local schedule file alone is lost on
+// every restart/redeploy, which previously left the cron silently disabled.
+let durableSchedule = null;
+let durableScheduleStore = null;
+
+function setDurableScheduleStore(store) {
+  durableScheduleStore = store || null;
+}
+
+function setDurableSchedule(schedule) {
+  durableSchedule = schedule && typeof schedule === "object" ? { ...schedule } : null;
+}
+
+/**
+ * Defaults used when no schedule has been persisted anywhere. The schedule is
+ * enabled by default so a fresh or restarted instance keeps syncing; set
+ * SCHEDULE_ENABLED=false to start with the cron off.
+ */
+function defaultSchedule() {
+  return {
+    cron: String(process.env.SCHEDULE_CRON || "").trim() || "30 0 * * *",
+    timezone: String(process.env.SCHEDULE_TIMEZONE || "").trim() || "America/Chicago",
+    enabled: process.env.SCHEDULE_ENABLED === undefined
+      ? true
+      : isTruthy(process.env.SCHEDULE_ENABLED)
+  };
+}
+
 function readPersistedSchedule() {
   const schedulePath = getScheduleConfigPath();
   if (!schedulePath || !fs.existsSync(schedulePath)) return {};
 
   try {
     const parsed = JSON.parse(fs.readFileSync(schedulePath, "utf-8"));
+    // A local file-config holds the whole client config; only its schedule
+    // section is relevant here.
+    if (parsed && Array.isArray(parsed.clients)) return parsed._serverConfig?.schedule || {};
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch (error) {
     throw new Error(`Schedule configuration is invalid: ${error.message}`);
@@ -208,10 +240,14 @@ function readPersistedSchedule() {
 
 function getScheduleConfig() {
   if (!config) loadConfig();
-  return {
+  const merged = {
+    ...defaultSchedule(),
     ...(config.server.schedule || {}),
-    ...readPersistedSchedule()
+    ...readPersistedSchedule(),
+    ...(durableSchedule || {})
   };
+  merged.enabled = merged.enabled === true;
+  return merged;
 }
 
 function writeJsonAtomically(filePath, value) {
@@ -222,16 +258,36 @@ function writeJsonAtomically(filePath, value) {
   fs.renameSync(temporaryPath, filePath);
 }
 
-function persistSchedule(patch) {
+async function persistSchedule(patch) {
   if (!config) loadConfig();
   const next = { ...getScheduleConfig(), ...patch };
-  const schedulePath = getScheduleConfigPath();
+  next.enabled = next.enabled === true;
 
-  if (!schedulePath) {
-    throw new Error("No writable schedule configuration path is available.");
+  // Durable store first: in managed mode this is the source of truth that
+  // survives restarts. Fail loudly rather than pretend the change was saved.
+  if (durableScheduleStore) {
+    await durableScheduleStore.save(next);
+    durableSchedule = { ...next };
   }
 
-  writeJsonAtomically(schedulePath, next);
+  const schedulePath = getScheduleConfigPath();
+  if (!schedulePath) {
+    if (!durableScheduleStore) {
+      throw new Error("No writable schedule configuration path is available.");
+    }
+  } else if (configPath && path.resolve(schedulePath) === path.resolve(configPath)) {
+    // File-based client config: update only its _serverConfig.schedule section
+    // so the client list in the same file is preserved.
+    const current = readJsonFile(schedulePath);
+    current._serverConfig = { ...(current._serverConfig || {}), schedule: next };
+    writeJsonAtomically(schedulePath, current);
+  } else if (durableScheduleStore) {
+    // Local cache only; the durable store above is authoritative.
+    try { writeJsonAtomically(schedulePath, next); } catch (_) {}
+  } else {
+    writeJsonAtomically(schedulePath, next);
+  }
+
   config.server.schedule = next;
   return next;
 }
@@ -308,5 +364,7 @@ module.exports = {
   getConfigPath,
   getConfigSource,
   getScheduleConfig,
-  persistSchedule
+  persistSchedule,
+  setDurableSchedule,
+  setDurableScheduleStore
 };

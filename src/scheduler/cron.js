@@ -48,7 +48,7 @@ function startCron() {
     logger.info(`[Cron] Scheduled sync triggered.`);
     try {
       const clients = getActiveClients();
-      await runFullSync(clients);
+      await runFullSync(clients, { triggeredBy: "cron" });
     } catch (e) {
       logger.error(`[Cron] Scheduled sync failed: ${e.message}`);
     }
