@@ -14,16 +14,52 @@ function normalizeFieldMap(value) {
   return value && typeof value === "object" ? value : {};
 }
 
+const EMOJI_PATTERN = /[\u{1F300}-\u{1FAFF}☀-➿️]/gu;
+
+/**
+ * Canonical key for comparing GHL field names. Strips emoji (GHL names such
+ * as "Needed for Emerald 🔒"), collapses whitespace and ignores case, matching
+ * how live field names are normalized in ghlAdmin.
+ */
 function normalizeFieldName(value) {
-  return String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
+  return String(value || "")
+    .replace(EMOJI_PATTERN, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }
 
+function hasDecoration(name) {
+  return String(name || "") !== String(name || "").replace(EMOJI_PATTERN, "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Map canonical field name -> ID. When a stored map holds both a plain and a
+ * decorated variant of the same name, the plain name wins, because that is the
+ * key the upload uses.
+ */
 function fieldIdMap(value) {
-  return Object.entries(normalizeFieldMap(value)).reduce((map, [name, id]) => {
+  const map = {};
+  const fromPlainName = {};
+  for (const [name, id] of Object.entries(normalizeFieldMap(value))) {
     const normalizedName = normalizeFieldName(name);
-    if (normalizedName && id) map[normalizedName] = id;
-    return map;
-  }, {});
+    if (!normalizedName || !id) continue;
+    const plain = !hasDecoration(name);
+    if (map[normalizedName] && fromPlainName[normalizedName] && !plain) continue;
+    map[normalizedName] = id;
+    fromPlainName[normalizedName] = plain;
+  }
+  return map;
+}
+
+/**
+ * Look up a field ID by name, tolerating emoji/case/spacing differences
+ * between the code's field names and the stored GHL names.
+ */
+function resolveFieldId(fieldMap, fieldName) {
+  const map = normalizeFieldMap(fieldMap);
+  if (map[fieldName]) return map[fieldName];
+  return fieldIdMap(map)[normalizeFieldName(fieldName)] || null;
 }
 
 function hasCompleteProtectedFieldMapping(value) {
@@ -118,6 +154,9 @@ function inspectProtectedFieldSource(contacts, previousSyncStats = {}) {
 
 module.exports = {
   PROTECTED_CUSTOM_FIELDS,
+  normalizeFieldName,
+  fieldIdMap,
+  resolveFieldId,
   compareProtectedFieldMapping,
   hasCompleteProtectedFieldMapping,
   missingProtectedFieldNames,

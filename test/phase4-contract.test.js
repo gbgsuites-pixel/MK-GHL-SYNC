@@ -245,3 +245,59 @@ test('blocked sync keeps the previous protected-field baseline', async () => {
     supabase.updateManagedClient = original;
   }
 });
+
+test('country values are converted to ISO codes GHL accepts', () => {
+  const { normalizeCountry } = require('../src/utils/dataHelpers');
+  assert.equal(normalizeCountry('USA'), 'US');
+  assert.equal(normalizeCountry('United States'), 'US');
+  assert.equal(normalizeCountry('united states of america'), 'US');
+  assert.equal(normalizeCountry('us'), 'US');
+  assert.equal(normalizeCountry('Canada'), 'CA');
+  assert.equal(normalizeCountry('Puerto Rico'), 'PR');
+  assert.equal(normalizeCountry('Not A Country'), '');
+  assert.equal(normalizeCountry(''), '');
+});
+
+test('GHL requests retry timeouts and 5xx but not client errors', async () => {
+  process.env.GHL_RETRY_DELAY_MS = '1';
+  const { _requestWithRetry } = require('../src/sync/ghlSync');
+
+  let calls = 0;
+  const recovered = await _requestWithRetry(async () => {
+    calls++;
+    if (calls === 1) throw new Error('timeout of 30000ms exceeded');
+    if (calls === 2) return { status: 503, headers: {} };
+    return { status: 200, headers: {} };
+  });
+  assert.equal(recovered.response.status, 200);
+  assert.equal(recovered.attempts, 3);
+
+  calls = 0;
+  const rejected = await _requestWithRetry(async () => { calls++; return { status: 422, headers: {} }; });
+  assert.equal(rejected.response.status, 422);
+  assert.equal(calls, 1);
+});
+
+test('field names match across emoji, case and spacing; plain names win', () => {
+  const { fieldIdMap, resolveFieldId } = require('../src/core/protectedFields');
+  const map = fieldIdMap({
+    'Needed for Emerald 🔒': 'from-decorated',
+    'Needed for Emerald': 'from-plain',
+    'Career  Level 🔒': 'career-id',
+  });
+  assert.equal(map['needed for emerald'], 'from-plain');
+  assert.equal(resolveFieldId({ 'Career Level 🔒': 'career-id' }, 'Career Level'), 'career-id');
+
+  // A stored decorated name that differs from the live plain ID is detected.
+  const check = compareProtectedFieldMapping(
+    Object.fromEntries(PROTECTED_CUSTOM_FIELDS.map((name) => [`${name} 🔒`, `id-${name}`])),
+    Object.fromEntries(PROTECTED_CUSTOM_FIELDS.map((name) => [name, `id-${name}`]))
+  );
+  assert.equal(check.ok, true);
+
+  const payload = buildCustomFieldsPayload(
+    { customFields: { 'Career Level': 'Ruby' } },
+    { 'Career Level 🔒': 'career-id' }
+  );
+  assert.deepEqual(payload, [{ id: 'career-id', field_value: 'Ruby' }]);
+});
