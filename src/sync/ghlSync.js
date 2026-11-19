@@ -10,6 +10,8 @@
 
 const axios = require("axios");
 const logger = require("../utils/logger");
+const { normalizeCountry } = require("../utils/dataHelpers");
+const { fieldIdMap, normalizeFieldName } = require("../core/protectedFields");
 
 const GHL_API_BASE = "https://services.leadconnectorhq.com";
 const configuredChunkSize = parseInt(process.env.GHL_CHUNK_SIZE, 10);
@@ -21,14 +23,64 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+const MAX_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = parseInt(process.env.GHL_RETRY_DELAY_MS, 10) || 2000;
+
+function isRetryableStatus(status) {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+function retryDelayMs(response, attempt) {
+  const retryAfter = Number(response?.headers?.["retry-after"]);
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    return Math.min(retryAfter * 1000, 30000);
+  }
+  return RETRY_BASE_DELAY_MS * attempt;
+}
+
+/**
+ * Run a GHL request, retrying timeouts, network errors, rate limits (429)
+ * and server errors (5xx). Client errors such as 400/401/403/422 are returned
+ * immediately because repeating them cannot succeed.
+ * Returns { response, attempts }; throws the last error if every attempt threw.
+ */
+async function requestWithRetry(makeRequest) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = await makeRequest();
+      if (!isRetryableStatus(response.status) || attempt === MAX_ATTEMPTS) {
+        return { response, attempts: attempt };
+      }
+      logger.debug(`[GHL] HTTP ${response.status}; retrying (attempt ${attempt + 1}/${MAX_ATTEMPTS}).`);
+      await sleep(retryDelayMs(response, attempt));
+    } catch (error) {
+      lastError = error;
+      error.attempts = attempt;
+      if (attempt === MAX_ATTEMPTS) break;
+      logger.debug(`[GHL] ${error.message}; retrying (attempt ${attempt + 1}/${MAX_ATTEMPTS}).`);
+      await sleep(retryDelayMs(null, attempt));
+    }
+  }
+  throw lastError;
+}
+
 /**
  * Build the customFields array for GHL from the contact's customFields object.
  */
 function buildCustomFieldsPayload(contact, customFieldMap) {
   const payload = [];
+  const exact = customFieldMap || {};
+  // Fall back to a name lookup that ignores emoji/case/spacing so a GHL field
+  // renamed to e.g. "Career Level 🔒" is not silently dropped from uploads.
+  let normalized = null;
   for (const fieldName in contact.customFields) {
     if (!contact.customFields.hasOwnProperty(fieldName)) continue;
-    const fieldId  = customFieldMap[fieldName];
+    let fieldId = exact[fieldName];
+    if (!fieldId) {
+      if (!normalized) normalized = fieldIdMap(exact);
+      fieldId = normalized[normalizeFieldName(fieldName)];
+    }
     const fieldVal = contact.customFields[fieldName];
     if (fieldId && fieldVal !== "" && fieldVal !== null && fieldVal !== undefined) {
       payload.push({ id: fieldId, field_value: String(fieldVal) });
@@ -46,14 +98,14 @@ async function searchDuplicate(apiToken, locationId, contact) {
     + (!contact.email && contact.phone ? `&phone=${encodeURIComponent(contact.phone)}` : "");
 
   try {
-    const resp = await axios.get(url, {
+    const { response: resp } = await requestWithRetry(() => axios.get(url, {
       headers: {
         "Authorization": `Bearer ${apiToken}`,
         "Version":       "2021-07-28"
       },
       timeout: 15000,
       validateStatus: () => true
-    });
+    }));
 
     if (resp.status === 200) {
       const data = resp.data;
@@ -78,16 +130,25 @@ async function upsertContact(apiToken, locationId, contact) {
     city:        contact.city        || "",
     state:       contact.state       || "",
     postalCode:  contact.postalCode  || "",
-    country:     contact.country     || "US",
     dateOfBirth: contact.dateOfBirth || "",
     tags:        contact.tags,
     locationId:  locationId,
     customFields: contact.customFields || []
   };
 
+  // Empty country keeps the previous "US" default. A value that cannot be
+  // mapped to an ISO code is left out rather than sent and rejected (422).
+  const rawCountry = String(contact.country || "").trim();
+  const country = rawCountry ? normalizeCountry(rawCountry) : "US";
+  if (country) {
+    payload.country = country;
+  } else {
+    logger.debug(`[GHL] Unrecognized country value omitted from upsert.`);
+  }
+
   if (contact.email) payload.email = contact.email;
 
-  const resp = await axios.post(
+  const { response: resp, attempts } = await requestWithRetry(() => axios.post(
     `${GHL_API_BASE}/contacts/upsert`,
     payload,
     {
@@ -99,11 +160,12 @@ async function upsertContact(apiToken, locationId, contact) {
       timeout: 30000,
       validateStatus: () => true
     }
-  );
+  ));
 
   return {
     statusCode: resp.status,
     data: resp.data,
+    attempts,
     contactId: (resp.data && resp.data.contact && resp.data.contact.id) ? resp.data.contact.id : ""
   };
 }
@@ -145,6 +207,7 @@ async function processSingleContact(apiToken, locationId, contact, customFieldMa
     success: (result.statusCode === 200 || result.statusCode === 201),
     contactId: result.contactId,
     statusCode: result.statusCode,
+    retryAttempts: Math.max(0, (result.attempts || 1) - 1),
     error: (result.statusCode !== 200 && result.statusCode !== 201)
       ? result.data
       : null
@@ -174,6 +237,7 @@ async function syncToGhl(ghlConfig, contacts, listName, options = {}) {
   const allErrors = [];
   let totalSynced = 0;
   let totalSkipped = 0;
+  let totalRetries = 0;
 
   logger.info(`[GHL Sync] Queuing ${total} contacts for chunked sync...`);
 
@@ -190,6 +254,7 @@ async function syncToGhl(ghlConfig, contacts, listName, options = {}) {
 
       try {
         const result = await processSingleContact(apiToken, locationId, contact, customFields);
+        totalRetries += result.retryAttempts || 0;
 
         if (result.skipped) {
           skippedCount++;
@@ -205,6 +270,7 @@ async function syncToGhl(ghlConfig, contacts, listName, options = {}) {
             statusCode:  result.statusCode,
             contactId:   result.contactId,
             error:       JSON.stringify(result.error || ""),
+            retryAttempts: result.retryAttempts || 0,
             payload:     JSON.stringify(contact)
           });
         }
@@ -218,6 +284,7 @@ async function syncToGhl(ghlConfig, contacts, listName, options = {}) {
           statusCode:  "EXCEPTION",
           contactId:   "",
           error:       e.message,
+          retryAttempts: Math.max(0, (e.attempts || 1) - 1),
           payload:     JSON.stringify(contact)
         });
       }
@@ -267,6 +334,7 @@ async function syncToGhl(ghlConfig, contacts, listName, options = {}) {
   return {
     synced:   totalSynced,
     skipped:  totalSkipped,
+    retryCount: totalRetries,
     failed:   allErrors.length,
     errors:   allErrors,
     total
@@ -274,6 +342,7 @@ async function syncToGhl(ghlConfig, contacts, listName, options = {}) {
 }
 
 module.exports = {
+  _requestWithRetry: requestWithRetry,
   syncToGhl,
   processSingleContact,
   searchDuplicate,

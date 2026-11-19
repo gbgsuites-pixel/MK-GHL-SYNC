@@ -179,7 +179,60 @@ function getStarConsultantQuarterInfo(date) {
   return { months, startDate };
 }
 
+// ── Country normalization ──
+// GHL only accepts ISO 3166-1 alpha-2 codes ("US"); Mary Kay returns free text
+// such as "USA" or "United States", which GHL rejects with
+// 422 "country must be valid".
+const COUNTRY_ALIASES = {
+  "usa": "US", "u.s.": "US", "u.s.a.": "US", "u s a": "US", "us of a": "US",
+  "united states": "US", "united states of america": "US", "america": "US",
+  "uk": "GB", "u.k.": "GB", "great britain": "GB", "britain": "GB",
+  "england": "GB", "scotland": "GB", "wales": "GB", "northern ireland": "GB",
+  "mex": "MX", "can": "CA", "pri": "PR"
+};
+
+let countryNameIndex = null;
+function buildCountryNameIndex() {
+  const index = {};
+  try {
+    const names = new Intl.DisplayNames(["en"], { type: "region" });
+    const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    for (const a of letters) {
+      for (const b of letters) {
+        const code = a + b;
+        const name = names.of(code);
+        if (name && name !== code) index[name.toLowerCase()] = code;
+      }
+    }
+  } catch (_) {
+    // Without ICU region names, only aliases and 2-letter codes are mapped.
+  }
+  return index;
+}
+
+/**
+ * Convert a country value to an ISO alpha-2 code GHL accepts.
+ * Returns "" when the value cannot be mapped, so callers can omit it rather
+ * than send a value GHL will reject.
+ */
+function normalizeCountry(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const key = raw.toLowerCase().replace(/\s+/g, " ");
+  if (COUNTRY_ALIASES[key]) return COUNTRY_ALIASES[key];
+  if (/^[a-z]{2}$/i.test(raw)) {
+    if (!countryNameIndex) countryNameIndex = buildCountryNameIndex();
+    const code = raw.toUpperCase();
+    return Object.values(countryNameIndex).includes(code) || Object.keys(countryNameIndex).length === 0
+      ? code
+      : "";
+  }
+  if (!countryNameIndex) countryNameIndex = buildCountryNameIndex();
+  return countryNameIndex[key] || "";
+}
+
 module.exports = {
+  normalizeCountry,
   formatPhone,
   formatInTouchDate,
   reformatIsoDate,

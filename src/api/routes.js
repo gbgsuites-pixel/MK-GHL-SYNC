@@ -335,7 +335,59 @@ router.post("/api/v1/clients", requireAuth, requireManagedClients, async (req, r
   }
 });
 
+const DEFINITE_VALIDATION_FAILURES = new Set([
+  "MK_LOGIN_REJECTED",
+  "GHL_AUTH_FAILED",
+  "GHL_AUTH_INPUT_MISSING",
+  "GHL_LOCATION_NOT_FOUND",
+  "GHL_PROTECTED_FIELDS_MISSING",
+  "CREDENTIAL_DECRYPTION_FAILED"
+]);
+
+// ── PATCH /api/v1/clients/:id/credentials — Replace Mary Kay password and/or GHL token ──
+// Credentials are re-encrypted, never returned, and the client goes back to
+// pending_validation so it cannot sync until the new values are validated.
+router.patch("/api/v1/clients/:id/credentials", requireAuth, requireManagedClients, async (req, res) => {
+  if (isRunning()) {
+    return res.status(409).json({ error: "A sync is in progress. Update credentials after it finishes.", code: "SYNC_IN_PROGRESS" });
+  }
+  const password = req.body?.password;
+  const ghlApiToken = req.body?.ghlApiToken;
+  const patch = {};
+  if (password !== undefined && String(password) !== "") patch.password = String(password);
+  if (ghlApiToken !== undefined && String(ghlApiToken).trim() !== "") patch.ghlApiToken = String(ghlApiToken).trim();
+  if (Object.keys(patch).length === 0) {
+    return res.status(400).json({ error: "Provide a new password and/or ghlApiToken.", code: "INVALID_CREDENTIAL_INPUT" });
+  }
+  try {
+    const existing = await supabase.getManagedClient(req.params.id, { includeSecrets: false });
+    if (!existing) return res.status(404).json({ error: "Managed client not found." });
+    await invalidateSession(existing.consultantNum);
+    const updated = await supabase.updateManagedClient(req.params.id, {
+      ...patch,
+      status: "pending_validation",
+      validationStatus: "pending",
+      validationErrorCode: null
+    });
+    await refreshManagedClientCache();
+    logger.info(`[API] Credentials updated for ${existing.clientName}; validation required.`, {
+      category: "admin",
+      operation: "update_credentials",
+      clientId: existing.id,
+      metadata: { updatedPassword: Boolean(patch.password), updatedGhlToken: Boolean(patch.ghlApiToken) }
+    });
+    res.json({ client: managedClientResponse(updated), status: "pending_validation" });
+  } catch (e) {
+    res.status(500).json({ error: e.message, code: e.code || "CREDENTIAL_UPDATE_FAILED" });
+  }
+});
+
 router.post("/api/v1/clients/:id/validate-credentials", requireAuth, requireManagedClients, async (req, res) => {
+  // Validation forces a fresh Mary Kay login, which would close the browser a
+  // running sync is using.
+  if (isRunning()) {
+    return res.status(409).json({ error: "A sync is in progress. Validate after it finishes.", code: "SYNC_IN_PROGRESS" });
+  }
   let managedClient = null;
   try {
     managedClient = await supabase.getManagedClient(req.params.id, { includeSecrets: true });
@@ -375,22 +427,36 @@ router.post("/api/v1/clients/:id/validate-credentials", requireAuth, requireMana
     await refreshManagedClientCache();
     res.json({ client: managedClientResponse(updated), customFieldCount: fields.length });
   } catch (e) {
+    const code = e.code || "VALIDATION_FAILED";
+    // Only a definite credential/configuration problem deactivates a client.
+    // Temporary failures (Mary Kay maintenance, timeouts, GHL outages) are
+    // recorded but leave the client's status as it was, so one bad attempt
+    // does not drop an active client out of the nightly sync.
+    const definiteFailure = DEFINITE_VALIDATION_FAILURES.has(code);
     if (managedClient) {
       try {
-        await supabase.updateManagedClient(req.params.id, {
-          status: "invalid",
-          validationStatus: "invalid",
-          validationErrorCode: e.code || "VALIDATION_FAILED",
-          lastValidationAt: new Date().toISOString()
-        });
+        await supabase.updateManagedClient(req.params.id, definiteFailure
+          ? {
+            status: "invalid",
+            validationStatus: "invalid",
+            validationErrorCode: code,
+            lastValidationAt: new Date().toISOString()
+          }
+          : {
+            validationErrorCode: code,
+            lastValidationAt: new Date().toISOString()
+          });
         await refreshManagedClientCache();
       } catch (_) {}
       try { await invalidateSession(managedClient.consultantNum); } catch (_) {}
     }
-    res.status(422).json({
+    res.status(definiteFailure ? 422 : 503).json({
       error: e.message,
-      code: e.code || "VALIDATION_FAILED",
-      action: "Verify the Mary Kay credentials, GHL token, location ID, and custom-field permissions."
+      code,
+      retryable: !definiteFailure,
+      action: definiteFailure
+        ? "Verify the Mary Kay credentials, GHL token, location ID, and custom-field permissions."
+        : "This looks temporary. The client's status was not changed; try validating again later."
     });
   }
 });
